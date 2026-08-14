@@ -1,4 +1,4 @@
-## HyperVM - real single-file Proxmox LXC manager.
+## HyperVM - real Proxmox LXC manager.
 
 Install:
   ```pip install flask requests pandas```
