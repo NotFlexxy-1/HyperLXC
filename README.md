@@ -1,5 +1,7 @@
-
+"""
+================================================================================
  HyperVM  -  Powered by HyperNET LTD
+================================================================================
 
  A single-file, production-shaped Proxmox VE control panel that manages BOTH
  LXC containers and QEMU/KVM virtual machines, with a built-in web terminal
@@ -65,3 +67,6 @@
  * Every mutating action is written to an immutable audit trail.
  * pandas is used for live fleet analytics (distribution, pressure scoring,
    capacity forecasting and top-talker ranking).
+
+================================================================================
+"""
