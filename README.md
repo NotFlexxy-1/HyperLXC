@@ -84,6 +84,8 @@ WantedBy=multi-user.target
 `/api/create/qemu` · `/api/users*` · `/api/audit*` · `/api/inventory.csv` ·
 `/api/console/*` · `ws://…/ws/console/<token>`
 
+## Join hyperNET LTD for latest news **[Discord](https://discord.gg/qhRQZd2W66)**
+
 ## Notes
 
 - The Proxmox token never reaches the browser.
