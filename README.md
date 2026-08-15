@@ -1,72 +1,92 @@
-"""
-================================================================================
- HyperVM  -  Powered by HyperNET LTD
-================================================================================
+# HyperVM — Proxmox LXC + KVM control panel
 
- A single-file, production-shaped Proxmox VE control panel that manages BOTH
- LXC containers and QEMU/KVM virtual machines, with a built-in web terminal
- console bridged directly to the Proxmox websocket API.
+Single-file Flask panel (backend, REST API, websocket console bridge and the whole
+web UI live inside `hypervm.py`).
 
- Everything (backend, REST API, websocket console bridge, HTML, CSS and
- JavaScript front-end) lives inside this one Python file on purpose.
+## Install
 
---------------------------------------------------------------------------------
- INSTALL
---------------------------------------------------------------------------------
+```bash
+pip install -r hypervm-requirements.txt
+```
 
-     pip install flask flask-sock websocket-client requests pandas
+## Configure
 
---------------------------------------------------------------------------------
- RUN
---------------------------------------------------------------------------------
+```bash
+export PROXMOX_URL=https://192.168.1.10:8006
+export PROXMOX_TOKEN_ID='admin@pam!hypervm'
+export PROXMOX_TOKEN_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+export PROXMOX_VERIFY_TLS=false
 
-     python hypervm.py
+# only needed for the interactive web console (Proxmox rejects API tokens there)
+export PROXMOX_USER=root@pam
+export PROXMOX_PASSWORD=super-secret
 
-     then open  http://127.0.0.1:8080
+export HYPERVM_SECRET="$(python3 -c 'import secrets;print(secrets.token_hex(32))')"
+export HYPERVM_HOST=0.0.0.0
+export HYPERVM_PORT=8080
+export HYPERVM_DB=hypervm.db
+```
 
---------------------------------------------------------------------------------
- ENVIRONMENT
---------------------------------------------------------------------------------
+Setting `HYPERVM_SECRET` is important: without it a random key is generated on every
+start and all sessions are dropped on restart.
 
-     PROXMOX_URL=https://192.168.1.10:8006
-     PROXMOX_TOKEN_ID=admin@pam!hypervm
-     PROXMOX_TOKEN_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-     PROXMOX_VERIFY_TLS=false
+## Run
 
-     # Optional - only needed for the interactive console bridge, because
-     # Proxmox refuses API-token authentication on /vncwebsocket.
-     PROXMOX_USER=root@pam
-     PROXMOX_PASSWORD=super-secret
+```bash
+python3 hypervm.py
+# open http://127.0.0.1:8080
+```
 
-     HYPERVM_SECRET=replace-with-a-long-random-secret
-     HYPERVM_HOST=0.0.0.0
-     HYPERVM_PORT=8080
-     HYPERVM_DB=hypervm.db
+Default owner account: **admin / admin123** — change it in Settings immediately.
 
---------------------------------------------------------------------------------
- DEFAULT OWNER ACCOUNT
---------------------------------------------------------------------------------
+### Production
 
-     username: admin
-     password: admin123
+```bash
+gunicorn -k gevent -w 1 -b 0.0.0.0:8080 hypervm:APP
+```
 
-     Change it immediately from Settings -> Security.
+Use one worker (or a sticky-session proxy): the console bridge and the in-memory
+cache are per-process. Put nginx/Caddy in front for TLS.
 
---------------------------------------------------------------------------------
- SECURITY MODEL
---------------------------------------------------------------------------------
+## systemd
 
- * The Proxmox API token never leaves the server process. The browser only
-   ever talks to HyperVM's own REST API.
- * HyperVM users live in SQLite with PBKDF2-HMAC-SHA256 (310k iterations)
-   password hashes and per-user random salts.
- * Three roles: owner > admin > user.
-     - owner : everything, including user management and node level actions
-     - admin : full guest lifecycle (create / delete / power / console)
-     - user  : read-only dashboards plus power actions on assigned guests
- * Every mutating action is written to an immutable audit trail.
- * pandas is used for live fleet analytics (distribution, pressure scoring,
-   capacity forecasting and top-talker ranking).
+```ini
+[Unit]
+Description=HyperVM panel
+After=network.target
 
-================================================================================
-"""
+[Service]
+WorkingDirectory=/opt/hypervm
+EnvironmentFile=/opt/hypervm/.env
+ExecStart=/usr/bin/python3 /opt/hypervm/hypervm.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## What the panel does
+
+- Dashboard: node/guest/memory/storage KPIs, node pressure, pandas insights
+- Containers & VMs: search/filter, start, stop, reboot, console, CSV export
+- Manage drawer: cores/memory/name edit, disk grow, snapshots (create, rollback,
+  delete), backup, clone, migrate, destroy, raw config
+- Create LXC and QEMU VMs (template/ISO, storage, network, cloud-init fields)
+- Nodes, storage, cluster tasks, analytics, audit log with CSV export
+- Users: roles (owner > admin > user), enable/disable, per-guest assignments,
+  public registration toggle
+- xterm.js console bridged to the Proxmox termproxy websocket
+
+## Endpoints
+
+`GET /` UI · `GET /api/health` · `GET /api/meta` · `/api/auth/*` · `/api/cluster` ·
+`/api/nodes/*` · `/api/guest/<kind>/<node>/<vmid>/*` · `/api/create/lxc` ·
+`/api/create/qemu` · `/api/users*` · `/api/audit*` · `/api/inventory.csv` ·
+`/api/console/*` · `ws://…/ws/console/<token>`
+
+## Notes
+
+- The Proxmox token never reaches the browser.
+- Passwords are PBKDF2-HMAC-SHA256, 310k iterations, per-user salt.
+- Without `pandas` the panel still runs; the Analytics page degrades gracefully.
+- Without `flask-sock` + `websocket-client` everything works except the web console.
