@@ -1,6 +1,5 @@
-========================================
+
  HyperVM  -  Powered by HyperNET LTD
-========================================
 
  A single-file, production-shaped Proxmox VE control panel that manages BOTH
  LXC containers and QEMU/KVM virtual machines, with a built-in web terminal
