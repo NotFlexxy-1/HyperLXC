@@ -2410,3 +2410,690 @@ if SOCK and ws_client:
                 upstream.close()
             except Exception:
                 pass
+
+
+# ==============================================================================
+# SECTION 13 - META ENDPOINT
+# ==============================================================================
+
+
+@APP.get("/api/meta")
+def api_meta():
+    return jsonify(
+        app=APP_NAME,
+        vendor=APP_VENDOR,
+        tagline=APP_TAGLINE,
+        version=APP_VERSION,
+        logo=LOGO_URL,
+        os_types=OS_TYPES,
+        qemu_os_types=[{"value": v, "label": l} for v, l in QEMU_OS_TYPES],
+        lxc_templates=[{"value": v, "label": l} for v, l in DEFAULT_LXC_TEMPLATES],
+        lxc_actions=list(LXC_ACTIONS),
+        qemu_actions=list(QEMU_ACTIONS),
+        signup_open=bool(setting_get("signup_open", True)),
+    )
+
+
+# ==============================================================================
+# SECTION 14 - FRONT-END (single page app, served inline)
+# ==============================================================================
+
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>HyperVM - Powered by HyperNET LTD</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css"/>
+<style>
+:root{
+  --bg:#070b14; --panel:#0d1424; --panel2:#111b30; --line:#1d2942;
+  --txt:#e8eefc; --dim:#8fa2c4; --accent:#2f81f7; --accent2:#19c37d;
+  --warn:#f5a623; --bad:#f2545b; --radius:14px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);
+  font-family:ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;font-size:14px}
+a{color:var(--accent);text-decoration:none}
+button{font:inherit;cursor:pointer}
+.hidden{display:none !important}
+.btn{background:var(--accent);color:#fff;border:0;border-radius:10px;
+  padding:9px 14px;font-weight:600}
+.btn:hover{filter:brightness(1.1)}
+.btn.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}
+.btn.ok{background:var(--accent2)} .btn.warn{background:var(--warn);color:#20160a}
+.btn.bad{background:var(--bad)} .btn.sm{padding:5px 10px;font-size:12px;border-radius:8px}
+input,select,textarea{background:var(--panel2);border:1px solid var(--line);
+  color:var(--txt);border-radius:10px;padding:9px 11px;width:100%;outline:none}
+input:focus,select:focus{border-color:var(--accent)}
+label{display:block;font-size:12px;color:var(--dim);margin:0 0 5px}
+.field{margin-bottom:12px}
+.grid{display:grid;gap:12px}
+.g2{grid-template-columns:repeat(2,1fr)} .g3{grid-template-columns:repeat(3,1fr)}
+.g4{grid-template-columns:repeat(4,1fr)}
+@media(max-width:900px){.g2,.g3,.g4{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:16px}
+.card h3{margin:0 0 12px;font-size:14px;letter-spacing:.3px}
+.kpi{font-size:26px;font-weight:700} .kpi small{font-size:12px;color:var(--dim);font-weight:500}
+table{width:100%;border-collapse:collapse}
+th,td{padding:9px 8px;text-align:left;border-bottom:1px solid var(--line);font-size:13px}
+th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase}
+tbody tr:hover{background:#0f182b}
+.badge{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;
+  border:1px solid var(--line);color:var(--dim)}
+.badge.run{color:#0a2418;background:var(--accent2);border-color:transparent}
+.badge.stop{color:#fff;background:#3b4560;border-color:transparent}
+.bar{height:6px;border-radius:99px;background:#1a2338;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent)}
+.bar i.hot{background:var(--warn)} .bar i.crit{background:var(--bad)}
+#login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;
+  background:radial-gradient(1000px 500px at 50% -10%,#12244a,transparent),var(--bg)}
+#login .card{width:100%;max-width:390px}
+.brand{display:flex;align-items:center;gap:10px}
+.brand img{height:34px;border-radius:8px}
+.brand b{font-size:17px} .brand span{display:block;font-size:11px;color:var(--dim)}
+#shell{display:flex;min-height:100vh}
+aside{width:230px;background:var(--panel);border-right:1px solid var(--line);
+  padding:16px;display:flex;flex-direction:column;gap:6px;position:sticky;top:0;height:100vh}
+aside nav{display:flex;flex-direction:column;gap:4px;margin-top:14px;overflow:auto}
+aside nav button{background:transparent;border:0;color:var(--dim);text-align:left;
+  padding:9px 11px;border-radius:10px;font-weight:600}
+aside nav button:hover{background:var(--panel2);color:var(--txt)}
+aside nav button.active{background:var(--accent);color:#fff}
+main{flex:1;padding:22px;max-width:100%;overflow:hidden}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;gap:10px;flex-wrap:wrap}
+h2{margin:0;font-size:19px}
+.muted{color:var(--dim);font-size:12px}
+.modal{position:fixed;inset:0;background:rgba(3,6,14,.75);display:flex;
+  align-items:center;justify-content:center;padding:20px;z-index:50}
+.modal .card{width:100%;max-width:760px;max-height:88vh;overflow:auto}
+.toast{position:fixed;right:18px;bottom:18px;z-index:99;display:flex;
+  flex-direction:column;gap:8px}
+.toast div{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--accent);
+  padding:11px 14px;border-radius:10px;max-width:360px}
+.toast div.bad{border-left-color:var(--bad)} .toast div.ok{border-left-color:var(--accent2)}
+#term{height:60vh;background:#000;border-radius:10px;padding:6px}
+.rowline{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.scroll{overflow:auto;max-height:60vh}
+pre{background:#060a12;border:1px solid var(--line);border-radius:10px;padding:12px;
+  overflow:auto;font-size:12px;max-height:50vh}
+</style>
+</head>
+<body>
+
+<div id="login">
+  <div class="card">
+    <div class="brand" style="margin-bottom:18px">
+      <img id="logo1" alt="logo"/>
+      <div><b>HyperVM</b><span>Powered by HyperNET LTD</span></div>
+    </div>
+    <div id="loginBox">
+      <div class="field"><label>Username</label><input id="lu" autocomplete="username"/></div>
+      <div class="field"><label>Password</label><input id="lp" type="password" autocomplete="current-password"/></div>
+      <button class="btn" style="width:100%" onclick="doLogin()">Sign in</button>
+      <p class="muted" style="margin-top:12px">
+        No account? <a href="#" onclick="toggleAuth(1);return false">Create one</a>
+      </p>
+    </div>
+    <div id="signBox" class="hidden">
+      <div class="field"><label>Username</label><input id="su"/></div>
+      <div class="field"><label>Email (optional)</label><input id="se"/></div>
+      <div class="field"><label>Password (min 8)</label><input id="sp" type="password"/></div>
+      <button class="btn ok" style="width:100%" onclick="doSignup()">Create account</button>
+      <p class="muted" style="margin-top:12px">
+        <a href="#" onclick="toggleAuth(0);return false">Back to sign in</a>
+      </p>
+    </div>
+  </div>
+</div>
+
+<div id="shell" class="hidden">
+  <aside>
+    <div class="brand"><img id="logo2" alt="logo"/><div><b>HyperVM</b><span id="ver"></span></div></div>
+    <nav id="nav"></nav>
+    <div style="margin-top:auto">
+      <div class="muted" id="whoami"></div>
+      <button class="btn ghost sm" style="width:100%;margin-top:8px" onclick="doLogout()">Sign out</button>
+    </div>
+  </aside>
+  <main>
+    <div class="topbar">
+      <div><h2 id="pageTitle">Dashboard</h2><div class="muted" id="pageSub"></div></div>
+      <div class="rowline">
+        <button class="btn ghost sm" onclick="refresh(true)">Refresh</button>
+        <button class="btn sm" onclick="openCreate('lxc')">New LXC</button>
+        <button class="btn sm" onclick="openCreate('qemu')">New VM</button>
+      </div>
+    </div>
+    <div id="view"></div>
+  </main>
+</div>
+
+<div id="modalRoot"></div>
+<div class="toast" id="toast"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script>
+var ME=null, META=null, DATA={nodes:[],guests:[],storages:[],totals:{},analytics:{}}, PAGE_ID="dash", TIMER=null;
+
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];});}
+function toast(msg,kind){var t=document.getElementById("toast");var d=document.createElement("div");
+  d.className=kind||"";d.textContent=msg;t.appendChild(d);setTimeout(function(){d.remove();},5200);}
+function pctClass(v){return v>=90?"crit":(v>=70?"hot":"");}
+
+async function api(path,opts){
+  opts=opts||{};
+  var res=await fetch(path,{method:opts.method||"GET",
+    headers:{"Content-Type":"application/json"},
+    credentials:"same-origin",
+    body:opts.body?JSON.stringify(opts.body):undefined});
+  var data={};
+  try{data=await res.json();}catch(e){}
+  if(!res.ok){throw new Error(data.error||("Request failed ("+res.status+")"));}
+  return data;
+}
+
+function toggleAuth(sign){
+  document.getElementById("loginBox").classList.toggle("hidden",!!sign);
+  document.getElementById("signBox").classList.toggle("hidden",!sign);
+}
+async function doLogin(){
+  try{await api("/api/auth/login",{method:"POST",body:{
+    username:document.getElementById("lu").value,password:document.getElementById("lp").value}});
+    await boot();}catch(e){toast(e.message,"bad");}
+}
+async function doSignup(){
+  try{await api("/api/auth/signup",{method:"POST",body:{
+    username:document.getElementById("su").value,email:document.getElementById("se").value,
+    password:document.getElementById("sp").value}});
+    await boot();}catch(e){toast(e.message,"bad");}
+}
+async function doLogout(){try{await api("/api/auth/logout",{method:"POST"});}catch(e){}
+  clearInterval(TIMER);ME=null;location.reload();}
+
+var PAGES=[
+  {id:"dash",label:"Dashboard",role:"user"},
+  {id:"guests",label:"Containers & VMs",role:"user"},
+  {id:"nodes",label:"Nodes",role:"user"},
+  {id:"storage",label:"Storage",role:"user"},
+  {id:"tasks",label:"Tasks",role:"user"},
+  {id:"analytics",label:"Analytics",role:"user"},
+  {id:"users",label:"Users",role:"owner"},
+  {id:"audit",label:"Audit log",role:"admin"},
+  {id:"settings",label:"Settings",role:"user"}
+];
+var RANK={user:1,admin:2,owner:3};
+function can(role){return ME&&RANK[ME.role]>=RANK[role];}
+
+function drawNav(){
+  var nav=document.getElementById("nav");nav.innerHTML="";
+  PAGES.filter(function(p){return can(p.role);}).forEach(function(p){
+    var b=document.createElement("button");b.textContent=p.label;
+    b.className=(p.id===PAGE_ID?"active":"");
+    b.onclick=function(){PAGE_ID=p.id;drawNav();render();};
+    nav.appendChild(b);
+  });
+}
+
+async function boot(){
+  META=await api("/api/meta");
+  document.getElementById("logo1").src=META.logo;
+  document.getElementById("logo2").src=META.logo;
+  document.getElementById("ver").textContent="v"+META.version;
+  var me=await api("/api/auth/me");
+  ME=me.user;
+  if(!ME){document.getElementById("login").classList.remove("hidden");
+    document.getElementById("shell").classList.add("hidden");return;}
+  document.getElementById("login").classList.add("hidden");
+  document.getElementById("shell").classList.remove("hidden");
+  document.getElementById("whoami").textContent=ME.username+" ("+ME.role+")";
+  drawNav();
+  await refresh(false);
+  clearInterval(TIMER);TIMER=setInterval(function(){refresh(false);},15000);
+}
+
+async function refresh(force){
+  try{
+    DATA=await api("/api/cluster"+(force?"?force=1":""));
+    if(!DATA.connected){document.getElementById("pageSub").textContent=DATA.reason||"Proxmox not connected";}
+    else{document.getElementById("pageSub").textContent="Updated "+new Date().toLocaleTimeString();}
+  }catch(e){toast(e.message,"bad");}
+  render();
+}
+
+function render(){
+  var page=PAGES.filter(function(p){return p.id===PAGE_ID;})[0]||PAGES[0];
+  document.getElementById("pageTitle").textContent=page.label;
+  var v=document.getElementById("view");
+  if(PAGE_ID==="dash")v.innerHTML=viewDash();
+  else if(PAGE_ID==="guests")v.innerHTML=viewGuests();
+  else if(PAGE_ID==="nodes")v.innerHTML=viewNodes();
+  else if(PAGE_ID==="storage")v.innerHTML=viewStorage();
+  else if(PAGE_ID==="tasks"){v.innerHTML='<div class="card">Loading tasks...</div>';loadTasks();}
+  else if(PAGE_ID==="analytics")v.innerHTML=viewAnalytics();
+  else if(PAGE_ID==="users"){v.innerHTML='<div class="card">Loading users...</div>';loadUsers();}
+  else if(PAGE_ID==="audit"){v.innerHTML='<div class="card">Loading audit...</div>';loadAudit();}
+  else if(PAGE_ID==="settings")v.innerHTML=viewSettings();
+}
+
+function kpi(label,value,sub){
+  return '<div class="card"><div class="muted">'+esc(label)+'</div>'+
+    '<div class="kpi">'+esc(value)+'</div><div class="muted">'+esc(sub||"")+'</div></div>';
+}
+function barRow(pct){
+  return '<div class="bar"><i class="'+pctClass(pct)+'" style="width:'+Math.min(100,pct||0)+'%"></i></div>';
+}
+
+function viewDash(){
+  var t=DATA.totals||{};
+  var html='<div class="grid g4">'+
+    kpi("Nodes online",(t.nodes_online||0)+" / "+(t.nodes||0),(t.cores||0)+" CPU cores")+
+    kpi("Guests running",(t.running||0)+" / "+(t.guests||0),(t.lxc||0)+" LXC - "+(t.qemu||0)+" VM")+
+    kpi("Memory",(t.mem_pct||0)+"%",(t.mem_used_h||"0 B")+" of "+(t.mem_total_h||"0 B"))+
+    kpi("Storage",(t.disk_pct||0)+"%",(t.disk_used_h||"0 B")+" of "+(t.disk_total_h||"0 B"))+
+  '</div>';
+  html+='<div class="grid g2" style="margin-top:12px"><div class="card"><h3>Node pressure</h3>'+nodeTable()+'</div>';
+  html+='<div class="card"><h3>Insights</h3><ul class="muted" style="padding-left:18px;line-height:1.8">'+
+    ((DATA.analytics&&DATA.analytics.insights)||["No analytics available."]).map(function(i){
+      return "<li>"+esc(i)+"</li>";}).join("")+"</ul></div></div>";
+  html+='<div class="card" style="margin-top:12px"><h3>Recent guests</h3>'+guestTable((DATA.guests||[]).slice(0,10))+'</div>';
+  return html;
+}
+
+function nodeTable(){
+  var rows=(DATA.nodes||[]).map(function(n){
+    return "<tr><td><b>"+esc(n.node)+"</b><div class='muted'>"+esc(n.uptime_h)+"</div></td>"+
+      "<td>"+(n.status==="online"?"<span class='badge run'>online</span>":"<span class='badge stop'>"+esc(n.status)+"</span>")+"</td>"+
+      "<td>"+n.cpu_pct+"% <div class='muted'>"+n.cpus+" cores</div></td>"+
+      "<td style='min-width:120px'>"+barRow(n.mem_pct)+"<div class='muted'>"+esc(n.mem_used_h)+" / "+esc(n.mem_total_h)+"</div></td>"+
+      "<td style='min-width:120px'>"+barRow(n.disk_pct)+"<div class='muted'>"+esc(n.disk_used_h)+" / "+esc(n.disk_total_h)+"</div></td>"+
+      "</tr>";}).join("");
+  return "<div class='scroll'><table><thead><tr><th>Node</th><th>Status</th><th>CPU</th><th>Memory</th><th>Disk</th></tr></thead><tbody>"+
+    (rows||"<tr><td colspan='5' class='muted'>No nodes.</td></tr>")+"</tbody></table></div>";
+}
+
+function guestTable(list){
+  var rows=list.map(function(g){
+    var run=g.status==="running";
+    return "<tr><td><b>"+esc(g.name)+"</b><div class='muted'>"+g.vmid+" - "+esc(g.node)+"</div></td>"+
+      "<td><span class='badge'>"+esc(g.kind_label)+"</span></td>"+
+      "<td><span class='badge "+(run?"run":"stop")+"'>"+esc(g.status)+"</span></td>"+
+      "<td>"+g.cpu_pct+"%<div class='muted'>"+g.cpus+" vCPU</div></td>"+
+      "<td style='min-width:110px'>"+barRow(g.mem_pct)+"<div class='muted'>"+esc(g.mem_used_h)+" / "+esc(g.mem_total_h)+"</div></td>"+
+      "<td class='muted'>"+esc(g.uptime_h)+"</td>"+
+      "<td class='rowline'>"+
+        (run?"<button class='btn sm warn' onclick=\"act('"+g.kind+"','"+esc(g.node)+"',"+g.vmid+",'shutdown')\">Stop</button>":
+             "<button class='btn sm ok' onclick=\"act('"+g.kind+"','"+esc(g.node)+"',"+g.vmid+",'start')\">Start</button>")+
+        "<button class='btn sm ghost' onclick=\"act('"+g.kind+"','"+esc(g.node)+"',"+g.vmid+",'reboot')\">Reboot</button>"+
+        "<button class='btn sm ghost' onclick=\"openConsole('"+g.kind+"','"+esc(g.node)+"',"+g.vmid+")\">Console</button>"+
+        "<button class='btn sm ghost' onclick=\"openGuest('"+g.kind+"','"+esc(g.node)+"',"+g.vmid+")\">Manage</button>"+
+      "</td></tr>";}).join("");
+  return "<div class='scroll'><table><thead><tr><th>Guest</th><th>Type</th><th>Status</th><th>CPU</th><th>Memory</th><th>Uptime</th><th></th></tr></thead><tbody>"+
+    (rows||"<tr><td colspan='7' class='muted'>Nothing here yet.</td></tr>")+"</tbody></table></div>";
+}
+
+var FILTER={q:"",kind:"all",status:"all"};
+function viewGuests(){
+  var list=(DATA.guests||[]).filter(function(g){
+    if(FILTER.kind!=="all"&&g.kind!==FILTER.kind)return false;
+    if(FILTER.status!=="all"&&g.status!==FILTER.status)return false;
+    if(FILTER.q&&(g.name+" "+g.vmid+" "+g.node).toLowerCase().indexOf(FILTER.q.toLowerCase())<0)return false;
+    return true;});
+  return '<div class="card"><div class="grid g4" style="margin-bottom:12px">'+
+    '<input placeholder="Search name, vmid, node" value="'+esc(FILTER.q)+'" oninput="FILTER.q=this.value;render();this.focus()"/>'+
+    '<select onchange="FILTER.kind=this.value;render()">'+opt(["all","lxc","qemu"],FILTER.kind)+'</select>'+
+    '<select onchange="FILTER.status=this.value;render()">'+opt(["all","running","stopped"],FILTER.status)+'</select>'+
+    '<a class="btn ghost sm" style="text-align:center;padding:9px" href="/api/inventory.csv">Export CSV</a>'+
+    '</div>'+guestTable(list)+'</div>';
+}
+function opt(values,sel){return values.map(function(v){
+  return '<option value="'+esc(v)+'"'+(v===sel?" selected":"")+'>'+esc(v)+'</option>';}).join("");}
+
+function viewNodes(){return '<div class="card">'+nodeTable()+'</div>';}
+
+function viewStorage(){
+  var rows=(DATA.storages||[]).map(function(s){
+    return "<tr><td><b>"+esc(s.storage)+"</b><div class='muted'>"+esc(s.node)+"</div></td>"+
+      "<td class='muted'>"+esc(s.type)+"</td><td class='muted'>"+esc(s.content||"")+"</td>"+
+      "<td style='min-width:140px'>"+barRow(s.used_pct)+"<div class='muted'>"+esc(s.used_h)+" / "+esc(s.total_h)+"</div></td>"+
+      "<td class='muted'>"+esc(s.avail_h)+"</td></tr>";}).join("");
+  return "<div class='card'><table><thead><tr><th>Storage</th><th>Type</th><th>Content</th><th>Used</th><th>Free</th></tr></thead><tbody>"+
+    (rows||"<tr><td colspan='5' class='muted'>No storage visible.</td></tr>")+"</tbody></table></div>";
+}
+
+function viewAnalytics(){
+  var a=DATA.analytics||{};
+  if(!a.available)return '<div class="card">Analytics needs pandas installed on the server.</div>';
+  function tbl(title,rows,cols){
+    return '<div class="card"><h3>'+esc(title)+'</h3><table><thead><tr>'+
+      cols.map(function(c){return "<th>"+esc(c[0])+"</th>";}).join("")+'</tr></thead><tbody>'+
+      ((rows||[]).map(function(r){return "<tr>"+cols.map(function(c){
+        return "<td>"+esc(r[c[1]])+"</td>";}).join("")+"</tr>";}).join("")||
+        "<tr><td class='muted' colspan='"+cols.length+"'>No data.</td></tr>")+
+      '</tbody></table></div>';
+  }
+  return '<div class="grid g2">'+
+    tbl("By node",a.by_node,[["Node","node"],["Guests","guests"],["Running","running"],["vCPU","vcpus"],["Memory","mem_h"],["CPU %","cpu"]])+
+    tbl("By type",a.by_kind,[["Type","kind_label"],["Count","count"],["Running","running"],["vCPU","vcpus"],["Memory","mem_h"]])+
+    tbl("Top CPU",a.top_cpu,[["VMID","vmid"],["Name","name"],["Node","node"],["CPU %","cpu_pct"],["Mem %","mem_pct"]])+
+    tbl("Top memory",a.top_mem,[["VMID","vmid"],["Name","name"],["Node","node"],["Memory","mem_used_h"],["Mem %","mem_pct"]])+
+    tbl("Pressure",a.pressure,[["Node","node"],["Score","score"],["Band","band"],["CPU %","cpu_pct"],["Mem %","mem_pct"]])+
+    tbl("Memory forecast",a.forecast,[["Node","node"],["Trend","trend_per_hour"],["Hours to full","hours_to_full"],["Samples","samples"]])+
+  '</div>';
+}
+
+async function loadTasks(){
+  try{var d=await api("/api/tasks");
+    var rows=(d.tasks||[]).slice(0,80).map(function(t){
+      var ok=(t.status==="OK"||t.status===undefined);
+      return "<tr><td class='muted'>"+esc(t.node||"")+"</td><td>"+esc(t.type||"")+"</td>"+
+        "<td class='muted'>"+esc(t.id||"")+"</td><td class='muted'>"+esc(t.user||"")+"</td>"+
+        "<td><span class='badge "+(ok?"run":"stop")+"'>"+esc(t.status||"running")+"</span></td>"+
+        "<td class='muted'>"+esc(t.starttime?new Date(t.starttime*1000).toLocaleString():"")+"</td></tr>";}).join("");
+    document.getElementById("view").innerHTML="<div class='card'><table><thead><tr><th>Node</th><th>Type</th><th>Target</th><th>User</th><th>Status</th><th>Started</th></tr></thead><tbody>"+
+      (rows||"<tr><td colspan='6' class='muted'>No tasks.</td></tr>")+"</tbody></table></div>";
+  }catch(e){document.getElementById("view").innerHTML="<div class='card'>"+esc(e.message)+"</div>";}
+}
+
+async function loadAudit(){
+  try{var d=await api("/api/audit?limit=200");
+    var rows=(d.entries||[]).map(function(a){
+      return "<tr><td class='muted'>"+esc(a.created_at)+"</td><td>"+esc(a.username)+"</td>"+
+        "<td>"+esc(a.action)+"</td><td class='muted'>"+esc(a.target)+"</td>"+
+        "<td class='muted'>"+esc(a.detail)+"</td><td class='muted'>"+esc(a.ip)+"</td>"+
+        "<td>"+(a.ok?"<span class='badge run'>ok</span>":"<span class='badge stop'>fail</span>")+"</td></tr>";}).join("");
+    document.getElementById("view").innerHTML="<div class='card'><div class='rowline' style='margin-bottom:10px'>"+
+      (can("owner")?"<a class='btn ghost sm' href='/api/audit/export.csv'>Export CSV</a>":"")+"</div>"+
+      "<div class='scroll'><table><thead><tr><th>When</th><th>User</th><th>Action</th><th>Target</th><th>Detail</th><th>IP</th><th></th></tr></thead><tbody>"+
+      (rows||"<tr><td colspan='7' class='muted'>Empty.</td></tr>")+"</tbody></table></div></div>";
+  }catch(e){document.getElementById("view").innerHTML="<div class='card'>"+esc(e.message)+"</div>";}
+}
+
+async function loadUsers(){
+  try{var d=await api("/api/users");
+    var rows=(d.users||[]).map(function(u){
+      return "<tr><td><b>"+esc(u.username)+"</b><div class='muted'>"+esc(u.email||"")+"</div></td>"+
+        "<td><select class='sm' onchange=\"updUser("+u.id+",{role:this.value})\">"+
+          opt(["user","admin","owner"],u.role)+"</select></td>"+
+        "<td>"+(u.active?"<span class='badge run'>active</span>":"<span class='badge stop'>disabled</span>")+"</td>"+
+        "<td class='muted'>"+esc(u.vm_limit)+"</td>"+
+        "<td class='muted'>"+esc(u.last_login||"never")+"</td>"+
+        "<td class='muted'>"+((u.assignments||[]).map(function(a){return a.kind+":"+a.vmid;}).join(", ")||"all/none")+"</td>"+
+        "<td class='rowline'>"+
+          "<button class='btn sm ghost' onclick=\"updUser("+u.id+",{active:"+(u.active?0:1)+"})\">"+(u.active?"Disable":"Enable")+"</button>"+
+          "<button class='btn sm ghost' onclick=\"assignPrompt("+u.id+")\">Assign</button>"+
+          "<button class='btn sm bad' onclick=\"delUser("+u.id+")\">Delete</button>"+
+        "</td></tr>";}).join("");
+    document.getElementById("view").innerHTML=
+      "<div class='card' style='margin-bottom:12px'><h3>Create user</h3><div class='grid g4'>"+
+      "<input id='nu' placeholder='username'/><input id='ne' placeholder='email'/>"+
+      "<input id='np' placeholder='password (blank = generated)'/>"+
+      "<select id='nr'>"+opt(["user","admin","owner"],"user")+"</select></div>"+
+      "<button class='btn' style='margin-top:10px' onclick='createUser()'>Create</button>"+
+      "<label style='margin-top:14px'><input type='checkbox' style='width:auto' "+(d.signup_open?"checked":"")+
+      " onchange='toggleSignup(this.checked)'/> Public registration open</label></div>"+
+      "<div class='card'><table><thead><tr><th>User</th><th>Role</th><th>State</th><th>Limit</th><th>Last login</th><th>Assigned</th><th></th></tr></thead><tbody>"+
+      rows+"</tbody></table></div>";
+  }catch(e){document.getElementById("view").innerHTML="<div class='card'>"+esc(e.message)+"</div>";}
+}
+async function createUser(){
+  try{var r=await api("/api/users",{method:"POST",body:{
+    username:document.getElementById("nu").value,email:document.getElementById("ne").value,
+    password:document.getElementById("np").value,role:document.getElementById("nr").value}});
+    toast("User created. Password: "+r.password,"ok");loadUsers();}catch(e){toast(e.message,"bad");}
+}
+async function updUser(id,patch){try{await api("/api/users/"+id,{method:"PATCH",body:patch});
+  toast("User updated","ok");loadUsers();}catch(e){toast(e.message,"bad");}}
+async function delUser(id){if(!confirm("Delete this user?"))return;
+  try{await api("/api/users/"+id,{method:"DELETE"});loadUsers();}catch(e){toast(e.message,"bad");}}
+async function toggleSignup(open){try{await api("/api/settings/signup",{method:"POST",body:{open:!!open}});
+  toast("Saved","ok");}catch(e){toast(e.message,"bad");}}
+async function assignPrompt(id){
+  var v=prompt("Assign guest as node/kind/vmid  (example: pve/lxc/101)");
+  if(!v)return;var p=v.split("/");
+  try{await api("/api/users/"+id+"/assign",{method:"POST",
+    body:{node:p[0],kind:p[1],vmid:parseInt(p[2],10)}});loadUsers();}catch(e){toast(e.message,"bad");}
+}
+
+function viewSettings(){
+  return '<div class="grid g2"><div class="card"><h3>Change password</h3>'+
+    '<div class="field"><label>Current password</label><input id="pw0" type="password"/></div>'+
+    '<div class="field"><label>New password</label><input id="pw1" type="password"/></div>'+
+    '<button class="btn" onclick="changePw()">Update password</button></div>'+
+    '<div class="card"><h3>Session</h3><p class="muted">Signed in as <b>'+esc(ME.username)+
+    '</b> with role <b>'+esc(ME.role)+'</b>.</p>'+
+    '<p class="muted">HyperVM '+esc(META.version)+' - '+esc(META.tagline)+'</p>'+
+    '<button class="btn ghost" onclick="healthCheck()">Run health check</button></div></div>';
+}
+async function changePw(){
+  try{await api("/api/auth/password",{method:"PATCH",body:{
+    current:document.getElementById("pw0").value,next:document.getElementById("pw1").value}});
+    toast("Password updated","ok");}catch(e){toast(e.message,"bad");}
+}
+async function healthCheck(){try{var h=await api("/api/health");
+  modal("Health","<pre>"+esc(JSON.stringify(h,null,2))+"</pre>");}catch(e){toast(e.message,"bad");}}
+
+function modal(title,html,wide){
+  document.getElementById("modalRoot").innerHTML=
+    '<div class="modal" onclick="if(event.target===this)closeModal()"><div class="card" '+
+    (wide?'style="max-width:1000px"':'')+'><div class="topbar"><h2>'+esc(title)+'</h2>'+
+    '<button class="btn ghost sm" onclick="closeModal()">Close</button></div>'+html+'</div></div>';
+}
+function closeModal(){document.getElementById("modalRoot").innerHTML="";if(window.__ws){try{window.__ws.close();}catch(e){}window.__ws=null;}}
+
+async function act(kind,node,vmid,action){
+  try{await api("/api/guest/"+kind+"/"+encodeURIComponent(node)+"/"+vmid+"/action/"+action,{method:"POST"});
+    toast(action+" sent to "+vmid,"ok");setTimeout(function(){refresh(true);},2500);}
+  catch(e){toast(e.message,"bad");}
+}
+
+async function openGuest(kind,node,vmid){
+  try{
+    var d=await api("/api/guest/"+kind+"/"+encodeURIComponent(node)+"/"+vmid);
+    var snaps=(d.snapshots||[]).map(function(s){
+      return "<tr><td>"+esc(s.name)+"</td><td class='muted'>"+esc(s.description||"")+"</td>"+
+        "<td class='rowline'>"+
+        "<button class='btn sm ghost' onclick=\"snapAction('"+kind+"','"+esc(node)+"',"+vmid+",'"+esc(s.name)+"','rollback')\">Rollback</button>"+
+        "<button class='btn sm bad' onclick=\"snapAction('"+kind+"','"+esc(node)+"',"+vmid+",'"+esc(s.name)+"','delete')\">Delete</button>"+
+        "</td></tr>";}).join("");
+    var nodes=(DATA.nodes||[]).map(function(n){return n.node;});
+    var cfg=d.config||{};
+    modal("Manage "+(((d.status||{}).name)||vmid),
+      '<div class="grid g2"><div class="card"><h3>Resources</h3>'+
+      '<div class="field"><label>Cores</label><input id="mCores" value="'+esc(cfg.cores||"")+'"/></div>'+
+      '<div class="field"><label>Memory (MB)</label><input id="mMem" value="'+esc(cfg.memory||"")+'"/></div>'+
+      '<div class="field"><label>Name / hostname</label><input id="mName" value="'+esc(cfg.hostname||cfg.name||"")+'"/></div>'+
+      '<button class="btn" onclick="saveGuest(\''+kind+'\',\''+esc(node)+'\','+vmid+')">Save changes</button> '+
+      '<button class="btn ghost" onclick="resizeGuest(\''+kind+'\',\''+esc(node)+'\','+vmid+')">Grow disk +8G</button>'+
+      '</div><div class="card"><h3>Operations</h3><div class="rowline">'+
+      '<button class="btn ghost" onclick="openConsole(\''+kind+'\',\''+esc(node)+'\','+vmid+')">Console</button>'+
+      '<button class="btn ghost" onclick="backupGuest(\''+kind+'\',\''+esc(node)+'\','+vmid+')">Backup</button>'+
+      '<button class="btn ghost" onclick="cloneGuest(\''+kind+'\',\''+esc(node)+'\','+vmid+')">Clone</button>'+
+      '<button class="btn bad" onclick="destroyGuest(\''+kind+'\',\''+esc(node)+'\','+vmid+')">Destroy</button></div>'+
+      '<div class="field" style="margin-top:14px"><label>Migrate to node</label>'+
+      '<select id="mTarget">'+opt(nodes,node)+'</select></div>'+
+      '<button class="btn ghost" onclick="migrateGuest(\''+kind+'\',\''+esc(node)+'\','+vmid+')">Migrate</button>'+
+      '</div></div>'+
+      '<div class="card" style="margin-top:12px"><h3>Snapshots</h3>'+
+      '<div class="rowline" style="margin-bottom:10px"><input id="snapName" placeholder="snapshot name" style="max-width:260px"/>'+
+      '<button class="btn sm" onclick="snapCreate(\''+kind+'\',\''+esc(node)+'\','+vmid+')">Create snapshot</button></div>'+
+      '<table><tbody>'+(snaps||"<tr><td class='muted'>No snapshots.</td></tr>")+'</tbody></table></div>'+
+      '<div class="card" style="margin-top:12px"><h3>Raw config</h3><pre>'+esc(JSON.stringify(cfg,null,2))+'</pre></div>',
+      true);
+  }catch(e){toast(e.message,"bad");}
+}
+async function saveGuest(kind,node,vmid){
+  var body={cores:document.getElementById("mCores").value,memory:document.getElementById("mMem").value};
+  var nm=document.getElementById("mName").value;
+  if(nm){if(kind==="lxc")body.hostname=nm;else body.name=nm;}
+  try{await api("/api/guest/"+kind+"/"+encodeURIComponent(node)+"/"+vmid+"/config",{method:"PATCH",body:body});
+    toast("Saved","ok");refresh(true);}catch(e){toast(e.message,"bad");}
+}
+async function resizeGuest(kind,node,vmid){
+  try{await api("/api/guest/"+kind+"/"+encodeURIComponent(node)+"/"+vmid+"/resize",
+    {method:"POST",body:{disk:kind==="lxc"?"rootfs":"scsi0",size:"+8G"}});
+    toast("Disk resize requested","ok");}catch(e){toast(e.message,"bad");}
+}
+async function backupGuest(kind,node,vmid){
+  var storage=prompt("Backup storage","local");if(!storage)return;
+  try{await api("/api/guest/"+kind+"/"+encodeURIComponent(node)+"/"+vmid+"/backup",
+    {method:"POST",body:{storage:storage}});toast("Backup started","ok");}catch(e){toast(e.message,"bad");}
+}
+async function cloneGuest(kind,node,vmid){
+  var name=prompt("Name for the clone");if(!name)return;
+  try{var r=await api("/api/guest/"+kind+"/"+encodeURIComponent(node)+"/"+vmid+"/clone",
+    {method:"POST",body:{name:name,full:true}});toast("Clone started as "+r.newid,"ok");
+    closeModal();refresh(true);}catch(e){toast(e.message,"bad");}
+}
+async function migrateGuest(kind,node,vmid){
+  var target=document.getElementById("mTarget").value;
+  try{await api("/api/guest/"+kind+"/"+encodeURIComponent(node)+"/"+vmid+"/migrate",
+    {method:"POST",body:{target:target,online:true}});toast("Migration started","ok");
+    closeModal();refresh(true);}catch(e){toast(e.message,"bad");}
+}
+async function destroyGuest(kind,node,vmid){
+  if(prompt("Type the VMID to permanently destroy this guest")!==String(vmid))return;
+  try{await api("/api/guest/"+kind+"/"+encodeURIComponent(node)+"/"+vmid,{method:"DELETE"});
+    toast("Guest destroyed","ok");closeModal();refresh(true);}catch(e){toast(e.message,"bad");}
+}
+async function snapCreate(kind,node,vmid){
+  try{await api("/api/guest/"+kind+"/"+encodeURIComponent(node)+"/"+vmid+"/snapshots",
+    {method:"POST",body:{name:document.getElementById("snapName").value}});
+    toast("Snapshot requested","ok");openGuest(kind,node,vmid);}catch(e){toast(e.message,"bad");}
+}
+async function snapAction(kind,node,vmid,name,what){
+  if(what==="delete"&&!confirm("Delete snapshot "+name+"?"))return;
+  var base="/api/guest/"+kind+"/"+encodeURIComponent(node)+"/"+vmid+"/snapshots/"+encodeURIComponent(name);
+  try{await api(what==="delete"?base:base+"/rollback",{method:what==="delete"?"DELETE":"POST"});
+    toast("Done","ok");openGuest(kind,node,vmid);}catch(e){toast(e.message,"bad");}
+}
+
+async function openConsole(kind,node,vmid){
+  try{
+    var r=await api("/api/console/"+kind+"/"+encodeURIComponent(node)+"/"+vmid,{method:"POST"});
+    modal("Console - "+node+"/"+vmid,'<div id="term"></div>',true);
+    var term=new Terminal({fontSize:13,cursorBlink:true,theme:{background:"#000000"}});
+    var fit=new FitAddon.FitAddon();term.loadAddon(fit);
+    term.open(document.getElementById("term"));fit.fit();
+    var proto=location.protocol==="https:"?"wss":"ws";
+    var ws=new WebSocket(proto+"://"+location.host+"/ws/console/"+r.token);
+    window.__ws=ws;
+    ws.onopen=function(){term.writeln("\x1b[32mConnected.\x1b[0m");
+      ws.send("\x01RESIZE:"+term.cols+":"+term.rows);};
+    ws.onmessage=function(ev){term.write(ev.data);};
+    ws.onclose=function(){term.writeln("\r\n\x1b[31mDisconnected.\x1b[0m");};
+    term.onData(function(d){if(ws.readyState===1)ws.send(d);});
+    window.addEventListener("resize",function(){try{fit.fit();
+      if(ws.readyState===1)ws.send("\x01RESIZE:"+term.cols+":"+term.rows);}catch(e){}});
+  }catch(e){toast(e.message,"bad");}
+}
+
+async function openCreate(kind){
+  if(!can("admin")){toast("Admins only","bad");return;}
+  var nodes=(DATA.nodes||[]).map(function(n){return n.node;});
+  if(!nodes.length){toast("No nodes available","bad");return;}
+  var stores=(DATA.storages||[]).map(function(s){return s.storage;})
+    .filter(function(v,i,a){return a.indexOf(v)===i;});
+  if(!stores.length)stores=["local-lvm"];
+  var common='<div class="grid g3">'+
+    '<div class="field"><label>Node</label><select id="cNode">'+opt(nodes,nodes[0])+'</select></div>'+
+    '<div class="field"><label>VMID (blank = next free)</label><input id="cVmid"/></div>'+
+    '<div class="field"><label>Storage</label><select id="cStore">'+opt(stores,stores[0])+'</select></div>'+
+    '<div class="field"><label>Cores</label><input id="cCores" value="'+(kind==="lxc"?"1":"2")+'"/></div>'+
+    '<div class="field"><label>Memory (MB)</label><input id="cMem" value="'+(kind==="lxc"?"1024":"2048")+'"/></div>'+
+    '<div class="field"><label>Disk (GB)</label><input id="cDisk" value="'+(kind==="lxc"?"8":"32")+'"/></div>'+
+    '<div class="field"><label>Bridge</label><input id="cBridge" value="vmbr0"/></div>'+
+    '<div class="field"><label>IP (dhcp or CIDR)</label><input id="cIp" value="dhcp"/></div>'+
+    '<div class="field"><label>Gateway</label><input id="cGw"/></div>'+
+    '</div>';
+  var extra;
+  if(kind==="lxc"){
+    var tpls=(META.lxc_templates||[]).map(function(t){
+      return '<option value="local:vztmpl/'+esc(t.value)+'">'+esc(t.label)+'</option>';}).join("");
+    extra='<div class="grid g3">'+
+      '<div class="field"><label>Hostname</label><input id="cName" placeholder="ct-name"/></div>'+
+      '<div class="field"><label>Template</label><select id="cTpl">'+tpls+'</select></div>'+
+      '<div class="field"><label>Root password (blank = generated)</label><input id="cPass"/></div>'+
+      '</div>';
+  }else{
+    var os=(META.qemu_os_types||[]).map(function(t){
+      return '<option value="'+esc(t.value)+'">'+esc(t.label)+'</option>';}).join("");
+    extra='<div class="grid g3">'+
+      '<div class="field"><label>Name</label><input id="cName" placeholder="vm-name"/></div>'+
+      '<div class="field"><label>Guest OS</label><select id="cOs">'+os+'</select></div>'+
+      '<div class="field"><label>ISO (storage:iso/file.iso)</label><input id="cIso"/></div>'+
+      '</div>';
+  }
+  modal("Create "+(kind==="lxc"?"LXC container":"virtual machine"),
+    '<div class="card">'+common+extra+
+    '<label><input type="checkbox" id="cStart" checked style="width:auto"/> Start after creation</label>'+
+    '<div style="margin-top:14px"><button class="btn" onclick="submitCreate(\''+kind+'\')">Create</button></div></div>',true);
+}
+async function submitCreate(kind){
+  var v=function(id){var e=document.getElementById(id);return e?e.value:"";};
+  var body={node:v("cNode"),vmid:v("cVmid"),storage:v("cStore"),cores:v("cCores"),
+    memory:v("cMem"),disk:v("cDisk"),bridge:v("cBridge"),ip:v("cIp"),gateway:v("cGw"),
+    start:document.getElementById("cStart").checked};
+  if(kind==="lxc"){body.hostname=v("cName");body.template=v("cTpl");body.password=v("cPass");}
+  else{body.name=v("cName");body.ostype=v("cOs");if(v("cIso"))body.iso=v("cIso");}
+  try{var r=await api("/api/create/"+kind,{method:"POST",body:body});
+    closeModal();
+    toast("Created "+r.vmid+(r.password?" - root password: "+r.password:""),"ok");
+    setTimeout(function(){refresh(true);},3000);}catch(e){toast(e.message,"bad");}
+}
+
+document.addEventListener("keydown",function(e){if(e.key==="Escape")closeModal();});
+document.addEventListener("keypress",function(e){
+  if(e.key==="Enter"&&!document.getElementById("login").classList.contains("hidden")){
+    if(document.getElementById("signBox").classList.contains("hidden"))doLogin();else doSignup();}});
+
+boot().catch(function(e){console.error(e);toast(e.message,"bad");});
+</script>
+</body>
+</html>
+"""
+
+
+@APP.get("/")
+def index():
+    return Response(PAGE, mimetype="text/html")
+
+
+@APP.get("/favicon.ico")
+def favicon():
+    return Response("", status=204)
+
+
+# ==============================================================================
+# SECTION 15 - ENTRY POINT
+# ==============================================================================
+
+
+def bootstrap():
+    init_db()
+    LOG.info("%s %s - %s", APP_NAME, APP_VERSION, APP_TAGLINE)
+    LOG.info("Database: %s", DB_PATH)
+    if PVE.configured():
+        LOG.info("Proxmox endpoint: %s", PROXMOX_URL)
+    else:
+        LOG.warning(
+            "Proxmox is not configured. Set PROXMOX_URL, PROXMOX_TOKEN_ID and "
+            "PROXMOX_TOKEN_SECRET, then restart."
+        )
+    if not (SOCK and ws_client):
+        LOG.warning(
+            "Console bridge disabled. Install flask-sock and websocket-client."
+        )
+    if not pd:
+        LOG.warning("pandas is not installed - analytics will be limited.")
+
+
+bootstrap()
+
+
+if __name__ == "__main__":
+    LOG.info("Listening on http://%s:%s", HOST, PORT)
+    APP.run(host=HOST, port=PORT, threaded=True, debug=False)
