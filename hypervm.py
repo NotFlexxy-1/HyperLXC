@@ -1,146 +1,476 @@
-
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-HyperVM - real single-file Proxmox LXC manager.
+================================================================================
+ HyperVM  -  Powered by HyperNET LTD
+================================================================================
 
-Install:
-    pip install flask requests pandas
+ A single-file, production-shaped Proxmox VE control panel that manages BOTH
+ LXC containers and QEMU/KVM virtual machines, with a built-in web terminal
+ console bridged directly to the Proxmox websocket API.
 
-Run:
-    python hypervm.py
+ Everything (backend, REST API, websocket console bridge, HTML, CSS and
+ JavaScript front-end) lives inside this one Python file on purpose.
 
-Environment:
-    PROXMOX_URL=https://192.168.1.10:8006
-    PROXMOX_TOKEN_ID=admin@pam!hypervm
-    PROXMOX_TOKEN_SECRET=YOUR_TOKEN_SECRET
-    PROXMOX_VERIFY_TLS=false
-    HYPERVM_SECRET=replace-with-a-long-random-secret
+--------------------------------------------------------------------------------
+ INSTALL
+--------------------------------------------------------------------------------
 
-Default HyperVM Owner:
-    admin / admin123
+     pip install flask flask-sock websocket-client requests pandas
 
-The Proxmox API token is server-side only. SQLite stores HyperVM users and
-PBKDF2 password hashes. pandas performs live cluster data analysis.
+--------------------------------------------------------------------------------
+ RUN
+--------------------------------------------------------------------------------
+
+     python hypervm.py
+
+     then open  http://127.0.0.1:8080
+
+--------------------------------------------------------------------------------
+ ENVIRONMENT
+--------------------------------------------------------------------------------
+
+     PROXMOX_URL=https://192.168.1.10:8006
+     PROXMOX_TOKEN_ID=admin@pam!hypervm
+     PROXMOX_TOKEN_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+     PROXMOX_VERIFY_TLS=false
+
+     # Optional - only needed for the interactive console bridge, because
+     # Proxmox refuses API-token authentication on /vncwebsocket.
+     PROXMOX_USER=root@pam
+     PROXMOX_PASSWORD=super-secret
+
+     HYPERVM_SECRET=replace-with-a-long-random-secret
+     HYPERVM_HOST=0.0.0.0
+     HYPERVM_PORT=8080
+     HYPERVM_DB=hypervm.db
+
+--------------------------------------------------------------------------------
+ DEFAULT OWNER ACCOUNT
+--------------------------------------------------------------------------------
+
+     username: admin
+     password: admin123
+
+     Change it immediately from Settings -> Security.
+
+--------------------------------------------------------------------------------
+ SECURITY MODEL
+--------------------------------------------------------------------------------
+
+ * The Proxmox API token never leaves the server process. The browser only
+   ever talks to HyperVM's own REST API.
+ * HyperVM users live in SQLite with PBKDF2-HMAC-SHA256 (310k iterations)
+   password hashes and per-user random salts.
+ * Three roles: owner > admin > user.
+     - owner : everything, including user management and node level actions
+     - admin : full guest lifecycle (create / delete / power / console)
+     - user  : read-only dashboards plus power actions on assigned guests
+ * Every mutating action is written to an immutable audit trail.
+ * pandas is used for live fleet analytics (distribution, pressure scoring,
+   capacity forecasting and top-talker ranking).
+
+================================================================================
 """
 
 import os
+import io
+import re
+import ssl
+import csv
+import json
+import time
+import hmac
+import string
 import sqlite3
 import secrets
 import hashlib
-import hmac
+import logging
+import threading
+import traceback
 from functools import wraps
-from datetime import datetime, timezone
-from urllib.parse import quote
+from datetime import datetime, timezone, timedelta
+from urllib.parse import quote, urlparse
 
 import requests
-import pandas as pd
-from flask import Flask, request, jsonify, session, render_template_string
+import urllib3
+
+try:
+    import pandas as pd
+except Exception:                                     # pragma: no cover
+    pd = None
+
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    session,
+    Response,
+)
+
+try:
+    from flask_sock import Sock
+except Exception:                                     # pragma: no cover
+    Sock = None
+
+try:
+    import websocket as ws_client                     # websocket-client
+except Exception:                                     # pragma: no cover
+    ws_client = None
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+)
+LOG = logging.getLogger("hypervm")
+
+
+# ==============================================================================
+# SECTION 1 - CONFIGURATION
+# ==============================================================================
+
+APP_NAME = "HyperVM"
+APP_VENDOR = "HyperNET LTD"
+APP_TAGLINE = "Powered by HyperNET LTD"
+APP_VERSION = "3.0.0"
+LOGO_URL = "https://i.postimg.cc/VvWF53xk/hypernet-logo.png"
+
+HOST = os.getenv("HYPERVM_HOST", "0.0.0.0")
+PORT = int(os.getenv("HYPERVM_PORT", "8080"))
+DB_PATH = os.getenv("HYPERVM_DB", "hypervm.db")
+
+PROXMOX_URL = os.getenv("PROXMOX_URL", "").rstrip("/")
+PROXMOX_TOKEN_ID = os.getenv("PROXMOX_TOKEN_ID", "")
+PROXMOX_TOKEN_SECRET = os.getenv("PROXMOX_TOKEN_SECRET", "")
+PROXMOX_USER = os.getenv("PROXMOX_USER", "")
+PROXMOX_PASSWORD = os.getenv("PROXMOX_PASSWORD", "")
+PROXMOX_VERIFY_TLS = os.getenv("PROXMOX_VERIFY_TLS", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+REQUEST_TIMEOUT = int(os.getenv("HYPERVM_TIMEOUT", "25"))
+CACHE_TTL = float(os.getenv("HYPERVM_CACHE_TTL", "4"))
+
+DEFAULT_LXC_TEMPLATES = [
+    ("debian-12-standard_12.7-1_amd64.tar.zst", "Debian 12 (Bookworm)"),
+    ("debian-11-standard_11.7-1_amd64.tar.zst", "Debian 11 (Bullseye)"),
+    ("ubuntu-24.04-standard_24.04-2_amd64.tar.zst", "Ubuntu 24.04 LTS"),
+    ("ubuntu-22.04-standard_22.04-1_amd64.tar.zst", "Ubuntu 22.04 LTS"),
+    ("ubuntu-20.04-standard_20.04-1_amd64.tar.zst", "Ubuntu 20.04 LTS"),
+    ("almalinux-9-default_20240911_amd64.tar.xz", "AlmaLinux 9"),
+    ("rockylinux-9-default_20240912_amd64.tar.xz", "Rocky Linux 9"),
+    ("alpine-3.20-default_20240908_amd64.tar.xz", "Alpine 3.20"),
+    ("centos-9-stream-default_20240828_amd64.tar.xz", "CentOS 9 Stream"),
+    ("fedora-40-default_20240909_amd64.tar.xz", "Fedora 40"),
+]
+
+OS_TYPES = [
+    "debian",
+    "ubuntu",
+    "centos",
+    "fedora",
+    "alpine",
+    "archlinux",
+    "opensuse",
+    "unmanaged",
+]
+
+QEMU_OS_TYPES = [
+    ("l26", "Linux 2.6 - 6.x kernel"),
+    ("win11", "Windows 11 / 2022"),
+    ("win10", "Windows 10 / 2016 / 2019"),
+    ("win8", "Windows 8 / 2012"),
+    ("w2k8", "Windows 2008"),
+    ("solaris", "Solaris"),
+    ("other", "Other"),
+]
+
+LXC_ACTIONS = ("start", "stop", "shutdown", "reboot", "suspend", "resume")
+QEMU_ACTIONS = ("start", "stop", "shutdown", "reboot", "reset", "suspend", "resume")
+
+ROLE_ORDER = {"user": 1, "admin": 2, "owner": 3}
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def human_bytes(value):
+    try:
+        value = float(value or 0)
+    except Exception:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    index = 0
+    while value >= 1024 and index < len(units) - 1:
+        value /= 1024.0
+        index += 1
+    return "%.2f %s" % (value, units[index])
+
+
+def safe_int(value, fallback=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return fallback
+
+
+def safe_float(value, fallback=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return fallback
+
+
+def pct(part, whole, digits=1):
+    part = safe_float(part)
+    whole = safe_float(whole)
+    if whole <= 0:
+        return 0.0
+    return round(part / whole * 100.0, digits)
+
+
+def random_password(length=16):
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*-_=+"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def slugify(value, fallback="guest"):
+    value = re.sub(r"[^a-zA-Z0-9-]+", "-", str(value or "")).strip("-").lower()
+    value = re.sub(r"-{2,}", "-", value)
+    return value[:60] or fallback
+
 
 APP = Flask(__name__)
 APP.secret_key = os.getenv("HYPERVM_SECRET", secrets.token_hex(32))
 APP.config["SESSION_COOKIE_HTTPONLY"] = True
 APP.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+APP.config["JSON_SORT_KEYS"] = False
+APP.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
-HOST = os.getenv("HYPERVM_HOST", "0.0.0.0")
-PORT = int(os.getenv("HYPERVM_PORT", "8080"))
-DB = os.getenv("HYPERVM_DB", "hypervm.db")
-
-PROXMOX_URL = os.getenv("PROXMOX_URL", "").rstrip("/")
-PROXMOX_TOKEN_ID = os.getenv("PROXMOX_TOKEN_ID", "")
-PROXMOX_TOKEN_SECRET = os.getenv("PROXMOX_TOKEN_SECRET", "")
-PROXMOX_VERIFY_TLS = os.getenv("PROXMOX_VERIFY_TLS", "false").lower() in {
-    "1", "true", "yes"
-}
-
-LOGO = "https://i.postimg.cc/VvWF53xk/hypernet-logo.png"
+SOCK = Sock(APP) if Sock else None
 
 
-# =========================
-# Database / authentication
-# =========================
+# ==============================================================================
+# SECTION 2 - DATABASE LAYER
+# ==============================================================================
+
+_DB_LOCK = threading.RLock()
+
 
 def connection():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    return c
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def db_run(sql, params=()):
+    with _DB_LOCK:
+        conn = connection()
+        try:
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def db_all(sql, params=()):
+    conn = connection()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def db_one(sql, params=()):
+    rows = db_all(sql, params)
+    return rows[0] if rows else None
+
+
+SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        username      TEXT UNIQUE NOT NULL,
+        email         TEXT,
+        password_hash TEXT NOT NULL,
+        role          TEXT NOT NULL DEFAULT 'user',
+        active        INTEGER NOT NULL DEFAULT 1,
+        vm_limit      INTEGER NOT NULL DEFAULT 5,
+        note          TEXT,
+        last_login    TEXT,
+        created_at    TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS assignments (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        node       TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        vmid       INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(user_id, node, kind, vmid)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS audit (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        username   TEXT,
+        role       TEXT,
+        action     TEXT NOT NULL,
+        target     TEXT,
+        detail     TEXT,
+        ip         TEXT,
+        ok         INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS samples (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        node       TEXT NOT NULL,
+        cpu        REAL,
+        mem_used   REAL,
+        mem_total  REAL,
+        disk_used  REAL,
+        disk_total REAL,
+        guests     INTEGER,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS settings (
+        key        TEXT PRIMARY KEY,
+        value      TEXT,
+        updated_at TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit(created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_samples_node ON samples(node, created_at DESC)",
+]
+
+
+def init_db():
+    with _DB_LOCK:
+        conn = connection()
+        try:
+            for statement in SCHEMA:
+                conn.execute(statement)
+            count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+            if count == 0:
+                conn.execute(
+                    "INSERT INTO users(username,email,password_hash,role,active,"
+                    "vm_limit,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        "admin",
+                        "admin@hypernet.local",
+                        make_password("admin123"),
+                        "owner",
+                        1,
+                        9999,
+                        now_iso(),
+                    ),
+                )
+                LOG.info("Seeded default owner account admin / admin123")
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def setting_get(key, fallback=None):
+    row = db_one("SELECT value FROM settings WHERE key=?", (key,))
+    if not row:
+        return fallback
+    try:
+        return json.loads(row["value"])
+    except Exception:
+        return row["value"]
+
+
+def setting_set(key, value):
+    db_run(
+        "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+        "updated_at=excluded.updated_at",
+        (key, json.dumps(value), now_iso()),
+    )
+
+
+# ==============================================================================
+# SECTION 3 - PASSWORDS, SESSIONS AND ROLE GUARDS
+# ==============================================================================
+
+PBKDF2_ROUNDS = 310000
 
 
 def make_password(password, salt=None):
     salt = salt or secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt, 310_000, 32
+        "sha256", str(password).encode("utf-8"), salt, PBKDF2_ROUNDS, 32
     )
     return salt.hex() + "$" + digest.hex()
 
 
 def check_password(password, stored):
     try:
-        salt_hex, digest = stored.split("$", 1)
+        salt_hex, digest = str(stored).split("$", 1)
         salt = bytes.fromhex(salt_hex)
         test = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), salt, 310_000, 32
+            "sha256", str(password).encode("utf-8"), salt, PBKDF2_ROUNDS, 32
         ).hex()
         return hmac.compare_digest(test, digest)
     except Exception:
         return False
 
 
-def init_db():
-    c = connection()
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS users ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "username TEXT UNIQUE NOT NULL,"
-        "password_hash TEXT NOT NULL,"
-        "role TEXT NOT NULL DEFAULT 'user',"
-        "active INTEGER NOT NULL DEFAULT 1,"
-        "created_at TEXT NOT NULL)"
-    )
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS audit ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "username TEXT,"
-        "action TEXT NOT NULL,"
-        "detail TEXT,"
-        "created_at TEXT NOT NULL)"
-    )
-    if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-        c.execute(
-            "INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
-            (
-                "admin",
-                make_password("admin123"),
-                "owner",
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            ),
-        )
-    c.commit()
-    c.close()
-
-
 def current_user():
     uid = session.get("uid")
     if not uid:
         return None
-    c = connection()
-    row = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-    c.close()
-    return dict(row) if row else None
+    return db_one("SELECT * FROM users WHERE id=? AND active=1", (uid,))
 
 
-def write_audit(action, detail=""):
-    c = connection()
-    c.execute(
-        "INSERT INTO audit(username,action,detail,created_at) VALUES(?,?,?,?)",
-        (
-            session.get("username", "system"),
-            action,
-            str(detail)[:1200],
-            datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        ),
-    )
-    c.commit()
-    c.close()
+def client_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "-"
+
+
+def write_audit(action, target="", detail="", ok=True):
+    try:
+        db_run(
+            "INSERT INTO audit(username,role,action,target,detail,ip,ok,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                session.get("username", "system"),
+                session.get("role", "system"),
+                action,
+                str(target)[:200],
+                str(detail)[:2000],
+                client_ip(),
+                1 if ok else 0,
+                now_iso(),
+            ),
+        )
+    except Exception as exc:                          # pragma: no cover
+        LOG.warning("audit failed: %s", exc)
+
+
+def role_at_least(user, role):
+    if not user:
+        return False
+    return ROLE_ORDER.get(user["role"], 0) >= ROLE_ORDER.get(role, 99)
 
 
 def login_required(fn):
@@ -149,180 +479,932 @@ def login_required(fn):
         if not current_user():
             return jsonify(error="Authentication required"), 401
         return fn(*args, **kwargs)
+
     return wrapped
 
 
 def admin_required(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
-        u = current_user()
-        if not u:
+        user = current_user()
+        if not user:
             return jsonify(error="Authentication required"), 401
-        if u["role"] not in ("owner", "admin"):
+        if not role_at_least(user, "admin"):
             return jsonify(error="Admin or Owner role required"), 403
         return fn(*args, **kwargs)
+
     return wrapped
 
 
 def owner_required(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
-        u = current_user()
-        if not u:
+        user = current_user()
+        if not user:
             return jsonify(error="Authentication required"), 401
-        if u["role"] != "owner":
+        if user["role"] != "owner":
             return jsonify(error="Owner role required"), 403
         return fn(*args, **kwargs)
+
     return wrapped
 
 
-# =========================
-# Proxmox REST API
-# =========================
+def guest_allowed(user, node, kind, vmid):
+    """Users only see guests assigned to them; admins and owners see all."""
+    if role_at_least(user, "admin"):
+        return True
+    row = db_one(
+        "SELECT id FROM assignments WHERE user_id=? AND node=? AND kind=? AND vmid=?",
+        (user["id"], node, kind, safe_int(vmid)),
+    )
+    return bool(row)
 
-class Proxmox:
+
+def assigned_pairs(user):
+    if role_at_least(user, "admin"):
+        return None
+    rows = db_all(
+        "SELECT node, kind, vmid FROM assignments WHERE user_id=?", (user["id"],)
+    )
+    return set((r["node"], r["kind"], safe_int(r["vmid"])) for r in rows)
+
+
+# ==============================================================================
+# SECTION 4 - PROXMOX VE API CLIENT
+# ==============================================================================
+
+
+class ProxmoxError(RuntimeError):
+    """Raised for any non-2xx response coming back from Proxmox VE."""
+
+    def __init__(self, message, status=502):
+        super(ProxmoxError, self).__init__(message)
+        self.status = status
+
+
+class TTLCache(object):
+    """Tiny thread-safe TTL cache so the dashboard can poll aggressively."""
+
+    def __init__(self, ttl=CACHE_TTL):
+        self.ttl = ttl
+        self._data = {}
+        self._lock = threading.RLock()
+
+    def get(self, key):
+        with self._lock:
+            item = self._data.get(key)
+            if not item:
+                return None
+            expires, value = item
+            if expires < time.time():
+                self._data.pop(key, None)
+                return None
+            return value
+
+    def put(self, key, value, ttl=None):
+        with self._lock:
+            self._data[key] = (time.time() + (ttl or self.ttl), value)
+            return value
+
+    def drop(self, prefix=""):
+        with self._lock:
+            for key in list(self._data):
+                if not prefix or str(key).startswith(prefix):
+                    self._data.pop(key, None)
+
+
+CACHE = TTLCache()
+
+
+class Proxmox(object):
+    """Thin, complete-enough REST wrapper around the Proxmox VE API."""
+
     def __init__(self):
-        self.base = (
-            PROXMOX_URL + "/api2/json"
-            if PROXMOX_URL
-            else ""
-        )
+        self.base = PROXMOX_URL + "/api2/json" if PROXMOX_URL else ""
         self.http = requests.Session()
+        self.http.headers["User-Agent"] = "HyperVM/%s (HyperNET LTD)" % APP_VERSION
         if PROXMOX_TOKEN_ID and PROXMOX_TOKEN_SECRET:
             self.http.headers["Authorization"] = (
                 "PVEAPIToken=" + PROXMOX_TOKEN_ID + "=" + PROXMOX_TOKEN_SECRET
             )
+        self._ticket = None
+        self._ticket_at = 0.0
+        self._ticket_lock = threading.RLock()
+
+    # -- plumbing ------------------------------------------------------------
 
     def configured(self):
-        return bool(
-            self.base and PROXMOX_TOKEN_ID and PROXMOX_TOKEN_SECRET
-        )
+        return bool(self.base and PROXMOX_TOKEN_ID and PROXMOX_TOKEN_SECRET)
 
-    def call(self, method, path, data=None):
+    def console_capable(self):
+        return bool(self.base and PROXMOX_USER and PROXMOX_PASSWORD)
+
+    def call(self, method, path, data=None, params=None):
         if not self.configured():
-            raise RuntimeError(
-                "Proxmox is not configured. Set PROXMOX_URL, "
-                "PROXMOX_TOKEN_ID and PROXMOX_TOKEN_SECRET."
+            raise ProxmoxError(
+                "Proxmox is not configured. Set PROXMOX_URL, PROXMOX_TOKEN_ID "
+                "and PROXMOX_TOKEN_SECRET in the environment.",
+                503,
             )
-        response = self.http.request(
-            method,
+        url = self.base + path
+        try:
+            response = self.http.request(
+                method.upper(),
+                url,
+                data=data or None,
+                params=params or None,
+                verify=PROXMOX_VERIFY_TLS,
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.exceptions.SSLError as exc:
+            raise ProxmoxError(
+                "TLS handshake failed. Set PROXMOX_VERIFY_TLS=false for a "
+                "self-signed Proxmox certificate. (%s)" % exc,
+                502,
+            )
+        except requests.exceptions.ConnectionError as exc:
+            raise ProxmoxError(
+                "Cannot reach Proxmox at %s (%s)" % (PROXMOX_URL, exc), 502
+            )
+        except requests.exceptions.Timeout:
+            raise ProxmoxError("Proxmox timed out after %ss" % REQUEST_TIMEOUT, 504)
+
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+
+        if not response.ok:
+            message = (
+                payload.get("errors")
+                or payload.get("message")
+                or (response.text or "")[:400]
+                or ("HTTP %s" % response.status_code)
+            )
+            raise ProxmoxError(str(message), response.status_code)
+
+        return payload.get("data", payload)
+
+    def get(self, path, params=None):
+        return self.call("GET", path, params=params)
+
+    def post(self, path, data=None):
+        return self.call("POST", path, data=data)
+
+    def put(self, path, data=None):
+        return self.call("PUT", path, data=data)
+
+    def delete(self, path, data=None):
+        return self.call("DELETE", path, data=data)
+
+    # -- ticket auth (needed for the websocket console) ----------------------
+
+    def ticket(self):
+        """Password ticket. Proxmox rejects API tokens on /vncwebsocket."""
+        with self._ticket_lock:
+            if self._ticket and (time.time() - self._ticket_at) < 3600:
+                return self._ticket
+            if not self.console_capable():
+                raise ProxmoxError(
+                    "Console needs PROXMOX_USER and PROXMOX_PASSWORD because "
+                    "Proxmox does not allow API tokens on the websocket endpoint.",
+                    503,
+                )
+            response = requests.post(
+                self.base + "/access/ticket",
+                data={"username": PROXMOX_USER, "password": PROXMOX_PASSWORD},
+                verify=PROXMOX_VERIFY_TLS,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if not response.ok:
+                raise ProxmoxError("Proxmox login failed for the console user", 401)
+            data = (response.json() or {}).get("data") or {}
+            self._ticket = {
+                "ticket": data.get("ticket"),
+                "CSRFPreventionToken": data.get("CSRFPreventionToken"),
+            }
+            self._ticket_at = time.time()
+            return self._ticket
+
+    def ticket_call(self, method, path, data=None):
+        """Call the API using the password ticket instead of the token."""
+        tk = self.ticket()
+        headers = {"CSRFPreventionToken": tk["CSRFPreventionToken"] or ""}
+        cookies = {"PVEAuthCookie": tk["ticket"] or ""}
+        response = requests.request(
+            method.upper(),
             self.base + path,
-            data=data or {},
+            data=data or None,
+            headers=headers,
+            cookies=cookies,
             verify=PROXMOX_VERIFY_TLS,
-            timeout=20,
+            timeout=REQUEST_TIMEOUT,
         )
         try:
             payload = response.json()
         except Exception:
             payload = {}
         if not response.ok:
-            message = (
-                payload.get("errors")
-                or payload.get("message")
-                or response.text[:500]
+            raise ProxmoxError(
+                str(
+                    payload.get("errors")
+                    or payload.get("message")
+                    or response.text[:300]
+                ),
+                response.status_code,
             )
-            raise RuntimeError(str(message))
         return payload.get("data", payload)
 
+    # -- cluster -------------------------------------------------------------
+
+    def version(self):
+        return self.get("/version")
+
     def nodes(self):
-        return self.call("GET", "/nodes")
+        return self.get("/nodes") or []
 
-    def lxcs(self, node):
-        return self.call(
-            "GET", "/nodes/" + quote(node, safe="") + "/lxc"
+    def cluster_resources(self, kind=None):
+        params = {"type": kind} if kind else None
+        return self.get("/cluster/resources", params=params) or []
+
+    def cluster_status(self):
+        return self.get("/cluster/status") or []
+
+    def cluster_tasks(self):
+        return self.get("/cluster/tasks") or []
+
+    def next_id(self):
+        try:
+            return safe_int(self.get("/cluster/nextid"), 0) or self._fallback_id()
+        except Exception:
+            return self._fallback_id()
+
+    def _fallback_id(self):
+        used = set()
+        try:
+            for item in self.cluster_resources():
+                if item.get("vmid"):
+                    used.add(safe_int(item["vmid"]))
+        except Exception:
+            pass
+        candidate = 100
+        while candidate in used:
+            candidate += 1
+        return candidate
+
+    # -- nodes ---------------------------------------------------------------
+
+    def node_status(self, node):
+        return self.get("/nodes/%s/status" % quote(node, safe=""))
+
+    def node_rrd(self, node, timeframe="hour"):
+        return self.get(
+            "/nodes/%s/rrddata" % quote(node, safe=""),
+            params={"timeframe": timeframe, "cf": "AVERAGE"},
+        ) or []
+
+    def node_tasks(self, node, limit=60):
+        return self.get(
+            "/nodes/%s/tasks" % quote(node, safe=""),
+            params={"limit": limit, "start": 0},
+        ) or []
+
+    def node_storage(self, node):
+        return self.get("/nodes/%s/storage" % quote(node, safe="")) or []
+
+    def node_networks(self, node):
+        return self.get("/nodes/%s/network" % quote(node, safe="")) or []
+
+    def storage_content(self, node, storage, content=None):
+        params = {"content": content} if content else None
+        return self.get(
+            "/nodes/%s/storage/%s/content"
+            % (quote(node, safe=""), quote(storage, safe="")),
+            params=params,
+        ) or []
+
+    def templates(self, node):
+        out = []
+        for store in self.node_storage(node):
+            if "vztmpl" not in str(store.get("content") or ""):
+                continue
+            try:
+                for item in self.storage_content(node, store["storage"], "vztmpl"):
+                    volid = item.get("volid") or ""
+                    out.append(
+                        {
+                            "volid": volid,
+                            "storage": store["storage"],
+                            "name": volid.split("/")[-1],
+                            "size": safe_int(item.get("size")),
+                        }
+                    )
+            except Exception as exc:
+                LOG.debug("template scan failed on %s: %s", store.get("storage"), exc)
+        return out
+
+    def isos(self, node):
+        out = []
+        for store in self.node_storage(node):
+            if "iso" not in str(store.get("content") or ""):
+                continue
+            try:
+                for item in self.storage_content(node, store["storage"], "iso"):
+                    volid = item.get("volid") or ""
+                    out.append(
+                        {
+                            "volid": volid,
+                            "storage": store["storage"],
+                            "name": volid.split("/")[-1],
+                            "size": safe_int(item.get("size")),
+                        }
+                    )
+            except Exception as exc:
+                LOG.debug("iso scan failed: %s", exc)
+        return out
+
+    def task_status(self, node, upid):
+        return self.get(
+            "/nodes/%s/tasks/%s/status"
+            % (quote(node, safe=""), quote(upid, safe=""))
         )
 
-    def lxc_status(self, node, vmid):
-        return self.call(
-            "GET",
-            "/nodes/" + quote(node, safe="") +
-            "/lxc/" + str(int(vmid)) + "/status/current",
+    def task_log(self, node, upid, limit=200):
+        return self.get(
+            "/nodes/%s/tasks/%s/log" % (quote(node, safe=""), quote(upid, safe="")),
+            params={"limit": limit},
+        ) or []
+
+    # -- generic guest helpers (kind = 'lxc' or 'qemu') ----------------------
+
+    @staticmethod
+    def _kind(kind):
+        kind = str(kind or "").lower()
+        if kind in ("lxc", "ct", "container"):
+            return "lxc"
+        if kind in ("qemu", "vm", "kvm"):
+            return "qemu"
+        raise ProxmoxError("Unknown guest type '%s'" % kind, 400)
+
+    def guest_base(self, node, kind, vmid):
+        return "/nodes/%s/%s/%s" % (
+            quote(node, safe=""),
+            self._kind(kind),
+            safe_int(vmid),
         )
 
-    def lxc_config(self, node, vmid):
-        return self.call(
-            "GET",
-            "/nodes/" + quote(node, safe="") +
-            "/lxc/" + str(int(vmid)) + "/config",
+    def guests(self, node, kind):
+        return self.get(
+            "/nodes/%s/%s" % (quote(node, safe=""), self._kind(kind))
+        ) or []
+
+    def guest_status(self, node, kind, vmid):
+        return self.get(self.guest_base(node, kind, vmid) + "/status/current")
+
+    def guest_config(self, node, kind, vmid):
+        return self.get(self.guest_base(node, kind, vmid) + "/config")
+
+    def guest_set_config(self, node, kind, vmid, data):
+        return self.put(self.guest_base(node, kind, vmid) + "/config", data)
+
+    def guest_rrd(self, node, kind, vmid, timeframe="hour"):
+        return self.get(
+            self.guest_base(node, kind, vmid) + "/rrddata",
+            params={"timeframe": timeframe, "cf": "AVERAGE"},
+        ) or []
+
+    def guest_action(self, node, kind, vmid, action):
+        kind = self._kind(kind)
+        allowed = LXC_ACTIONS if kind == "lxc" else QEMU_ACTIONS
+        if action not in allowed:
+            raise ProxmoxError("Unsupported %s action '%s'" % (kind, action), 400)
+        return self.post(self.guest_base(node, kind, vmid) + "/status/" + action)
+
+    def guest_delete(self, node, kind, vmid, purge=True):
+        return self.delete(
+            self.guest_base(node, kind, vmid),
+            {"purge": 1 if purge else 0, "destroy-unreferenced-disks": 1},
         )
 
-    def lxc_action(self, node, vmid, action):
-        if action not in (
-            "start", "stop", "shutdown", "reboot", "suspend", "resume"
-        ):
-            raise ValueError("Unsupported LXC action")
-        return self.call(
-            "POST",
-            "/nodes/" + quote(node, safe="") +
-            "/lxc/" + str(int(vmid)) + "/status/" + action,
+    def guest_clone(self, node, kind, vmid, newid, name=None, full=True):
+        data = {"newid": safe_int(newid), "full": 1 if full else 0}
+        if name:
+            data["hostname" if self._kind(kind) == "lxc" else "name"] = name
+        return self.post(self.guest_base(node, kind, vmid) + "/clone", data)
+
+    def guest_migrate(self, node, kind, vmid, target, online=True):
+        data = {"target": target}
+        if self._kind(kind) == "lxc":
+            data["restart"] = 1 if online else 0
+        else:
+            data["online"] = 1 if online else 0
+        return self.post(self.guest_base(node, kind, vmid) + "/migrate", data)
+
+    def guest_snapshots(self, node, kind, vmid):
+        return self.get(self.guest_base(node, kind, vmid) + "/snapshot") or []
+
+    def guest_snapshot_create(self, node, kind, vmid, name, description=""):
+        data = {"snapname": name}
+        if description:
+            data["description"] = description
+        return self.post(self.guest_base(node, kind, vmid) + "/snapshot", data)
+
+    def guest_snapshot_delete(self, node, kind, vmid, name):
+        return self.delete(
+            self.guest_base(node, kind, vmid) + "/snapshot/" + quote(name, safe="")
         )
+
+    def guest_snapshot_rollback(self, node, kind, vmid, name):
+        return self.post(
+            self.guest_base(node, kind, vmid)
+            + "/snapshot/"
+            + quote(name, safe="")
+            + "/rollback"
+        )
+
+    def guest_backup(self, node, kind, vmid, storage, mode="snapshot", compress="zstd"):
+        return self.post(
+            "/nodes/%s/vzdump" % quote(node, safe=""),
+            {
+                "vmid": safe_int(vmid),
+                "storage": storage,
+                "mode": mode,
+                "compress": compress,
+                "remove": 0,
+            },
+        )
+
+    def guest_resize(self, node, kind, vmid, disk, size):
+        return self.put(
+            self.guest_base(node, kind, vmid) + "/resize",
+            {"disk": disk, "size": size},
+        )
+
+    def guest_firewall_rules(self, node, kind, vmid):
+        return self.get(self.guest_base(node, kind, vmid) + "/firewall/rules") or []
+
+    # -- creation ------------------------------------------------------------
 
     def create_lxc(self, node, data):
-        return self.call(
+        return self.post("/nodes/%s/lxc" % quote(node, safe=""), data)
+
+    def create_qemu(self, node, data):
+        return self.post("/nodes/%s/qemu" % quote(node, safe=""), data)
+
+    # -- console -------------------------------------------------------------
+
+    def term_proxy(self, node, kind, vmid):
+        """Ask Proxmox for a term ticket, using password auth (token is refused)."""
+        kind = self._kind(kind)
+        path = "/nodes/%s/%s/%s/termproxy" % (
+            quote(node, safe=""),
+            kind,
+            safe_int(vmid),
+        )
+        return self.ticket_call("POST", path)
+
+    def node_term_proxy(self, node):
+        return self.ticket_call("POST", "/nodes/%s/termproxy" % quote(node, safe=""))
+
+    def vnc_proxy(self, node, kind, vmid):
+        kind = self._kind(kind)
+        return self.ticket_call(
             "POST",
-            "/nodes/" + quote(node, safe="") + "/lxc",
-            data,
+            "/nodes/%s/%s/%s/vncproxy" % (quote(node, safe=""), kind, safe_int(vmid)),
+            {"websocket": 1},
+        )
+
+    def agent_exec(self, node, vmid, command):
+        """qemu-guest-agent command execution (VMs only)."""
+        return self.post(
+            "/nodes/%s/qemu/%s/agent/exec" % (quote(node, safe=""), safe_int(vmid)),
+            {"command": command},
+        )
+
+    def agent_exec_status(self, node, vmid, pid):
+        return self.get(
+            "/nodes/%s/qemu/%s/agent/exec-status"
+            % (quote(node, safe=""), safe_int(vmid)),
+            params={"pid": safe_int(pid)},
         )
 
 
 PVE = Proxmox()
 
 
-def enriched_nodes():
-    result = []
-    for node in PVE.nodes() or []:
-        mem = float(node.get("mem") or 0)
-        maxmem = float(node.get("maxmem") or 0)
-        disk = float(node.get("disk") or 0)
-        maxdisk = float(node.get("maxdisk") or 0)
-        result.append(
-            {
-                **node,
-                "cpu_pct": round(float(node.get("cpu") or 0) * 100, 1),
-                "mem_pct": round(mem / maxmem * 100, 1) if maxmem else 0,
-                "disk_pct": round(disk / maxdisk * 100, 1) if maxdisk else 0,
-                "mem_used": mem,
-                "mem_total": maxmem,
-                "disk_used": disk,
-                "disk_total": maxdisk,
-                "uptime_hours": round(
-                    float(node.get("uptime") or 0) / 3600, 1
-                ),
-            }
-        )
-    return result
+# ==============================================================================
+# SECTION 5 - FLEET AGGREGATION + PANDAS ANALYTICS
+# ==============================================================================
 
 
-def all_containers(nodes):
-    rows = []
+def humanize_uptime(seconds):
+    seconds = safe_int(seconds)
+    if seconds <= 0:
+        return "offline"
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return "%dd %dh" % (days, hours)
+    if hours:
+        return "%dh %dm" % (hours, minutes)
+    return "%dm" % minutes
+
+
+def enrich_node(node):
+    mem = safe_float(node.get("mem"))
+    maxmem = safe_float(node.get("maxmem"))
+    disk = safe_float(node.get("disk"))
+    maxdisk = safe_float(node.get("maxdisk"))
+    uptime = safe_float(node.get("uptime"))
+    return {
+        "node": node.get("node"),
+        "status": node.get("status", "unknown"),
+        "type": "node",
+        "cpu_pct": round(safe_float(node.get("cpu")) * 100, 1),
+        "cpus": safe_int(node.get("maxcpu")),
+        "mem_used": mem,
+        "mem_total": maxmem,
+        "mem_pct": pct(mem, maxmem),
+        "disk_used": disk,
+        "disk_total": maxdisk,
+        "disk_pct": pct(disk, maxdisk),
+        "mem_used_h": human_bytes(mem),
+        "mem_total_h": human_bytes(maxmem),
+        "disk_used_h": human_bytes(disk),
+        "disk_total_h": human_bytes(maxdisk),
+        "uptime": uptime,
+        "uptime_h": humanize_uptime(uptime),
+        "level": node.get("level", ""),
+    }
+
+
+def enrich_guest(item):
+    kind = "lxc" if item.get("type") in ("lxc", "ct") else "qemu"
+    mem = safe_float(item.get("mem"))
+    maxmem = safe_float(item.get("maxmem"))
+    disk = safe_float(item.get("disk"))
+    maxdisk = safe_float(item.get("maxdisk"))
+    uptime = safe_float(item.get("uptime"))
+    return {
+        "vmid": safe_int(item.get("vmid")),
+        "name": item.get("name")
+        or item.get("hostname")
+        or ("guest-%s" % item.get("vmid")),
+        "node": item.get("node"),
+        "kind": kind,
+        "kind_label": "LXC" if kind == "lxc" else "VM",
+        "status": item.get("status", "unknown"),
+        "template": bool(safe_int(item.get("template"))),
+        "locked": item.get("lock") or "",
+        "tags": [t for t in str(item.get("tags") or "").split(";") if t],
+        "cpus": safe_int(item.get("maxcpu") or item.get("cpus")),
+        "cpu_pct": round(safe_float(item.get("cpu")) * 100, 1),
+        "mem_used": mem,
+        "mem_total": maxmem,
+        "mem_pct": pct(mem, maxmem),
+        "mem_used_h": human_bytes(mem),
+        "mem_total_h": human_bytes(maxmem),
+        "disk_used": disk,
+        "disk_total": maxdisk,
+        "disk_pct": pct(disk, maxdisk),
+        "disk_total_h": human_bytes(maxdisk),
+        "netin": safe_float(item.get("netin")),
+        "netout": safe_float(item.get("netout")),
+        "netin_h": human_bytes(item.get("netin")),
+        "netout_h": human_bytes(item.get("netout")),
+        "uptime": uptime,
+        "uptime_h": humanize_uptime(uptime),
+        "pool": item.get("pool") or "",
+    }
+
+
+def fleet_snapshot(force=False):
+    """One cached round-trip that powers the entire dashboard."""
+    if not force:
+        cached = CACHE.get("fleet")
+        if cached:
+            return cached
+
+    nodes = [enrich_node(n) for n in PVE.nodes()]
+    guests = []
+    try:
+        resources = PVE.cluster_resources("vm")
+        guests = [enrich_guest(r) for r in resources]
+    except ProxmoxError:
+        for node in nodes:
+            for kind in ("lxc", "qemu"):
+                try:
+                    for item in PVE.guests(node["node"], kind):
+                        item["node"] = node["node"]
+                        item["type"] = kind
+                        guests.append(enrich_guest(item))
+                except ProxmoxError as exc:
+                    LOG.warning(
+                        "guest list failed on %s/%s: %s", node["node"], kind, exc
+                    )
+
+    storages = []
     for node in nodes:
+        if node["status"] != "online":
+            continue
         try:
-            for x in PVE.lxcs(node["node"]) or []:
-                rows.append(
+            for store in PVE.node_storage(node["node"]):
+                total = safe_float(store.get("total"))
+                used = safe_float(store.get("used"))
+                storages.append(
                     {
-                        **x,
                         "node": node["node"],
-                        "cpu_pct": round(
-                            float(x.get("cpu") or 0) * 100, 1
-                        ),
-                        "mem_mb": round(
-                            float(x.get("mem") or 0) / 1024 / 1024, 1
-                        ),
-                        "disk_gb": round(
-                            float(x.get("disk") or 0)
-                            / 1024 / 1024 / 1024,
-                            2,
-                        ),
+                        "storage": store.get("storage"),
+                        "type": store.get("type"),
+                        "content": store.get("content"),
+                        "enabled": bool(safe_int(store.get("enabled"), 1)),
+                        "active": bool(safe_int(store.get("active"), 0)),
+                        "total": total,
+                        "used": used,
+                        "avail": safe_float(store.get("avail")),
+                        "total_h": human_bytes(total),
+                        "used_h": human_bytes(used),
+                        "avail_h": human_bytes(store.get("avail")),
+                        "used_pct": pct(used, total),
                     }
                 )
-        except Exception as exc:
-            rows.append({"node": node["node"], "error": str(exc)})
-    return rows
+        except ProxmoxError as exc:
+            LOG.debug("storage scan failed on %s: %s", node["node"], exc)
+
+    snapshot = {
+        "nodes": nodes,
+        "guests": guests,
+        "storages": storages,
+        "generated_at": now_iso(),
+    }
+    CACHE.put("fleet", snapshot)
+    record_samples(nodes, guests)
+    return snapshot
 
 
-# =========================
-# Authentication API
-# =========================
+def record_samples(nodes, guests):
+    """Persist a lightweight time series so pandas has history to chew on."""
+    try:
+        if CACHE.get("sample_stamp"):
+            return
+        CACHE.put("sample_stamp", True, ttl=55)
+        for node in nodes:
+            count = len([g for g in guests if g["node"] == node["node"]])
+            db_run(
+                "INSERT INTO samples(node,cpu,mem_used,mem_total,disk_used,"
+                "disk_total,guests,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    node["node"],
+                    node["cpu_pct"],
+                    node["mem_used"],
+                    node["mem_total"],
+                    node["disk_used"],
+                    node["disk_total"],
+                    count,
+                    now_iso(),
+                ),
+            )
+        db_run(
+            "DELETE FROM samples WHERE created_at < ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(
+                    timespec="seconds"
+                ),
+            ),
+        )
+    except Exception as exc:                          # pragma: no cover
+        LOG.debug("sample write failed: %s", exc)
+
+
+def compute_totals(snapshot):
+    nodes = snapshot.get("nodes") or []
+    guests = snapshot.get("guests") or []
+    running = [g for g in guests if g["status"] == "running"]
+    lxc = [g for g in guests if g["kind"] == "lxc"]
+    qemu = [g for g in guests if g["kind"] == "qemu"]
+    mem_used = sum(n["mem_used"] for n in nodes)
+    mem_total = sum(n["mem_total"] for n in nodes)
+    disk_used = sum(n["disk_used"] for n in nodes)
+    disk_total = sum(n["disk_total"] for n in nodes)
+    cpu_avg = round(sum(n["cpu_pct"] for n in nodes) / len(nodes), 1) if nodes else 0.0
+    return {
+        "nodes": len(nodes),
+        "nodes_online": len([n for n in nodes if n["status"] == "online"]),
+        "guests": len(guests),
+        "running": len(running),
+        "stopped": len(guests) - len(running),
+        "lxc": len(lxc),
+        "qemu": len(qemu),
+        "lxc_running": len([g for g in lxc if g["status"] == "running"]),
+        "qemu_running": len([g for g in qemu if g["status"] == "running"]),
+        "vcpus": sum(g["cpus"] for g in guests),
+        "cores": sum(n["cpus"] for n in nodes),
+        "cpu_avg": cpu_avg,
+        "mem_used": mem_used,
+        "mem_total": mem_total,
+        "mem_pct": pct(mem_used, mem_total),
+        "mem_used_h": human_bytes(mem_used),
+        "mem_total_h": human_bytes(mem_total),
+        "disk_used": disk_used,
+        "disk_total": disk_total,
+        "disk_pct": pct(disk_used, disk_total),
+        "disk_used_h": human_bytes(disk_used),
+        "disk_total_h": human_bytes(disk_total),
+        "net_in_h": human_bytes(sum(g["netin"] for g in guests)),
+        "net_out_h": human_bytes(sum(g["netout"] for g in guests)),
+    }
+
+
+def analytics(snapshot):
+    """pandas powered fleet intelligence."""
+    guests = snapshot.get("guests") or []
+    nodes = snapshot.get("nodes") or []
+    empty = {
+        "available": bool(pd),
+        "by_node": [],
+        "by_kind": [],
+        "by_status": [],
+        "top_cpu": [],
+        "top_mem": [],
+        "pressure": [],
+        "forecast": [],
+        "insights": [],
+    }
+    if not pd or not guests:
+        return empty
+
+    frame = pd.DataFrame(guests)
+    node_frame = pd.DataFrame(nodes)
+
+    by_node = (
+        frame.groupby("node")
+        .agg(
+            guests=("vmid", "count"),
+            running=("status", lambda s: int((s == "running").sum())),
+            vcpus=("cpus", "sum"),
+            mem=("mem_used", "sum"),
+            cpu=("cpu_pct", "mean"),
+        )
+        .reset_index()
+    )
+    by_node["cpu"] = by_node["cpu"].round(1)
+    by_node["mem_h"] = by_node["mem"].map(human_bytes)
+
+    by_kind = (
+        frame.groupby("kind_label")
+        .agg(
+            count=("vmid", "count"),
+            running=("status", lambda s: int((s == "running").sum())),
+            vcpus=("cpus", "sum"),
+            mem=("mem_used", "sum"),
+        )
+        .reset_index()
+    )
+    by_kind["mem_h"] = by_kind["mem"].map(human_bytes)
+
+    by_status = frame.groupby("status").agg(count=("vmid", "count")).reset_index()
+
+    top_cpu = frame.sort_values("cpu_pct", ascending=False).head(8)[
+        ["vmid", "name", "node", "kind_label", "cpu_pct", "mem_pct"]
+    ]
+    top_mem = frame.sort_values("mem_used", ascending=False).head(8)[
+        ["vmid", "name", "node", "kind_label", "mem_used_h", "mem_pct"]
+    ]
+
+    pressure = []
+    if not node_frame.empty:
+        node_frame["score"] = (
+            node_frame["cpu_pct"] * 0.4
+            + node_frame["mem_pct"] * 0.4
+            + node_frame["disk_pct"] * 0.2
+        ).round(1)
+        node_frame["band"] = pd.cut(
+            node_frame["score"],
+            bins=[-1, 45, 70, 85, 1000],
+            labels=["healthy", "warm", "hot", "critical"],
+        ).astype(str)
+        pressure = (
+            node_frame[["node", "score", "band", "cpu_pct", "mem_pct", "disk_pct"]]
+            .sort_values("score", ascending=False)
+            .to_dict("records")
+        )
+
+    forecast = []
+    history = db_all(
+        "SELECT node, mem_used, mem_total, created_at FROM samples "
+        "WHERE created_at > ? ORDER BY created_at ASC",
+        (
+            (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat(
+                timespec="seconds"
+            ),
+        ),
+    )
+    if history:
+        hist = pd.DataFrame(history)
+        hist["created_at"] = pd.to_datetime(hist["created_at"], errors="coerce", utc=True)
+        hist = hist.dropna(subset=["created_at"])
+        for node_name, chunk in hist.groupby("node"):
+            chunk = chunk.sort_values("created_at")
+            if len(chunk) < 3:
+                continue
+            xs = (
+                chunk["created_at"] - chunk["created_at"].iloc[0]
+            ).dt.total_seconds() / 3600.0
+            ys = chunk["mem_used"].astype(float)
+            span = max(float(xs.iloc[-1]), 1e-6)
+            slope = float((ys.iloc[-1] - ys.iloc[0]) / span)
+            total = float(chunk["mem_total"].iloc[-1] or 0)
+            used = float(ys.iloc[-1])
+            hours_left = None
+            if slope > 0 and total > used:
+                hours_left = round((total - used) / slope, 1)
+            forecast.append(
+                {
+                    "node": node_name,
+                    "trend_per_hour": human_bytes(abs(slope))
+                    + ("/h up" if slope >= 0 else "/h down"),
+                    "hours_to_full": hours_left,
+                    "samples": int(len(chunk)),
+                }
+            )
+
+    insights = []
+    stopped = frame[frame["status"] != "running"]
+    if len(stopped):
+        insights.append(
+            "%d guest(s) are not running and still reserve %s of disk."
+            % (len(stopped), human_bytes(stopped["disk_total"].sum()))
+        )
+    hot = frame[frame["mem_pct"] > 88]
+    if len(hot):
+        insights.append(
+            "%d guest(s) are above 88%% memory: %s"
+            % (len(hot), ", ".join(hot["name"].head(5).tolist()))
+        )
+    idle = frame[(frame["status"] == "running") & (frame["cpu_pct"] < 1.0)]
+    if len(idle):
+        insights.append(
+            "%d running guest(s) are effectively idle (<1%% CPU) - reclaim candidates."
+            % len(idle)
+        )
+    if not node_frame.empty:
+        busiest = node_frame.sort_values("mem_pct", ascending=False).iloc[0]
+        insights.append(
+            "Highest memory pressure: %s at %.1f%%."
+            % (busiest["node"], busiest["mem_pct"])
+        )
+    if not insights:
+        insights.append("Fleet is balanced. No action recommended.")
+
+    return {
+        "available": True,
+        "by_node": by_node.to_dict("records"),
+        "by_kind": by_kind.to_dict("records"),
+        "by_status": by_status.to_dict("records"),
+        "top_cpu": top_cpu.to_dict("records"),
+        "top_mem": top_mem.to_dict("records"),
+        "pressure": pressure,
+        "forecast": forecast,
+        "insights": insights,
+    }
+
+
+# ==============================================================================
+# SECTION 6 - REST API : AUTHENTICATION
+# ==============================================================================
+
+
+def public_user(row):
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "email": row.get("email"),
+        "role": row["role"],
+        "active": bool(row["active"]),
+        "vm_limit": row.get("vm_limit"),
+        "note": row.get("note"),
+        "last_login": row.get("last_login"),
+        "created_at": row.get("created_at"),
+    }
+
+
+@APP.errorhandler(ProxmoxError)
+def handle_proxmox_error(exc):
+    LOG.warning("Proxmox error: %s", exc)
+    return jsonify(error=str(exc)), getattr(exc, "status", 502)
+
+
+@APP.errorhandler(Exception)
+def handle_unexpected(exc):                            # pragma: no cover
+    if isinstance(exc, ProxmoxError):
+        return handle_proxmox_error(exc)
+    code = getattr(exc, "code", 500)
+    if isinstance(code, int) and 400 <= code < 600:
+        return jsonify(error=getattr(exc, "description", str(exc))), code
+    LOG.error("Unhandled: %s\n%s", exc, traceback.format_exc())
+    return jsonify(error="Internal error: %s" % exc), 500
+
 
 @APP.post("/api/auth/login")
 def api_login():
@@ -330,75 +1412,52 @@ def api_login():
     username = str(body.get("username", "")).strip().lower()
     password = str(body.get("password", ""))
 
-    c = connection()
-    row = c.execute(
-        "SELECT * FROM users WHERE username=?", (username,)
-    ).fetchone()
-    c.close()
-
-    if (
-        not row
-        or not row["active"]
-        or not check_password(password, row["password_hash"])
-    ):
+    row = db_one("SELECT * FROM users WHERE username=?", (username,))
+    if not row or not row["active"] or not check_password(password, row["password_hash"]):
+        time.sleep(0.4)
+        write_audit("login_failed", username, ok=False)
         return jsonify(error="Invalid username or password"), 401
 
     session.clear()
+    session.permanent = True
     session["uid"] = row["id"]
     session["username"] = row["username"]
-    write_audit("login")
-
-    return jsonify(
-        user={
-            "id": row["id"],
-            "username": row["username"],
-            "role": row["role"],
-        }
-    )
+    session["role"] = row["role"]
+    db_run("UPDATE users SET last_login=? WHERE id=?", (now_iso(), row["id"]))
+    write_audit("login", row["username"])
+    return jsonify(user=public_user(row))
 
 
 @APP.post("/api/auth/signup")
 def api_signup():
+    if setting_get("signup_open", True) is False:
+        return jsonify(error="Registration is currently closed"), 403
     body = request.get_json(silent=True) or {}
     username = str(body.get("username", "")).strip().lower()
     password = str(body.get("password", ""))
+    email = str(body.get("email", "")).strip()[:120]
 
-    if (
-        len(username) < 3
-        or len(username) > 32
-        or not username.replace("_", "").isalnum()
-    ):
-        return jsonify(error="Username must be 3-32 letters/numbers/underscores"), 400
-
+    if len(username) < 3 or len(username) > 32 or not username.replace("_", "").isalnum():
+        return jsonify(error="Username must be 3-32 letters, numbers or underscores"), 400
     if len(password) < 8:
         return jsonify(error="Password must be at least 8 characters"), 400
 
-    c = connection()
     try:
-        cur = c.execute(
-            "INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
-            (
-                username,
-                make_password(password),
-                "user",
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            ),
+        uid = db_run(
+            "INSERT INTO users(username,email,password_hash,role,active,vm_limit,"
+            "created_at) VALUES(?,?,?,?,?,?,?)",
+            (username, email, make_password(password), "user", 1, 3, now_iso()),
         )
-        c.commit()
-        uid = cur.lastrowid
     except sqlite3.IntegrityError:
-        c.close()
-        return jsonify(error="Username already exists"), 409
-    c.close()
+        return jsonify(error="That username is already taken"), 409
 
     session.clear()
     session["uid"] = uid
     session["username"] = username
-    write_audit("signup")
-
-    return jsonify(
-        user={"id": uid, "username": username, "role": "user"}
-    )
+    session["role"] = "user"
+    write_audit("signup", username)
+    row = db_one("SELECT * FROM users WHERE id=?", (uid,))
+    return jsonify(user=public_user(row))
 
 
 @APP.post("/api/auth/logout")
@@ -410,412 +1469,944 @@ def api_logout():
 
 @APP.get("/api/auth/me")
 def api_me():
-    u = current_user()
-    if not u:
-        return jsonify(user=None)
+    user = current_user()
     return jsonify(
-        user={"id": u["id"], "username": u["username"], "role": u["role"]}
+        user=public_user(user) if user else None,
+        proxmox_configured=PVE.configured(),
+        console_ready=PVE.console_capable() and bool(SOCK and ws_client),
+        version=APP_VERSION,
     )
 
 
 @APP.patch("/api/auth/password")
 @login_required
-def api_password():
+def api_change_password():
     body = request.get_json(silent=True) or {}
-    u = current_user()
-    if not check_password(
-        str(body.get("current", "")), u["password_hash"]
-    ):
+    user = current_user()
+    if not check_password(str(body.get("current", "")), user["password_hash"]):
         return jsonify(error="Current password is incorrect"), 400
-
-    new_password = str(body.get("next", ""))
-    if len(new_password) < 8:
-        return jsonify(error="Password must be at least 8 characters"), 400
-
-    c = connection()
-    c.execute(
-        "UPDATE users SET password_hash=? WHERE id=?",
-        (make_password(new_password), u["id"]),
-    )
-    c.commit()
-    c.close()
-    write_audit("password_changed")
+    nxt = str(body.get("next", ""))
+    if len(nxt) < 8:
+        return jsonify(error="New password must be at least 8 characters"), 400
+    db_run("UPDATE users SET password_hash=? WHERE id=?", (make_password(nxt), user["id"]))
+    write_audit("password_changed", user["username"])
     return jsonify(ok=True)
 
 
-# =========================
-# Proxmox API routes
-# =========================
+# ==============================================================================
+# SECTION 7 - REST API : USERS AND ASSIGNMENTS (owner only)
+# ==============================================================================
 
-@APP.get("/api/cluster")
-@login_required
-def api_cluster():
-    try:
-        nodes = enriched_nodes()
-        return jsonify(
-            connected=True,
-            nodes=nodes,
-            containers=all_containers(nodes),
-        )
-    except Exception as exc:
-        return jsonify(connected=False, error=str(exc)), 503
-
-
-@APP.get("/api/nodes")
-@login_required
-def api_nodes():
-    try:
-        return jsonify(nodes=enriched_nodes())
-    except Exception as exc:
-        return jsonify(error=str(exc)), 503
-
-
-@APP.get("/api/lxc/<node>/<int:vmid>")
-@login_required
-def api_lxc_detail(node, vmid):
-    try:
-        return jsonify(
-            status=PVE.lxc_status(node, vmid),
-            config=PVE.lxc_config(node, vmid),
-        )
-    except Exception as exc:
-        return jsonify(error=str(exc)), 503
-
-
-@APP.post("/api/lxc/<node>/<int:vmid>/<action>")
-@admin_required
-def api_lxc_action(node, vmid, action):
-    try:
-        task = PVE.lxc_action(node, vmid, action)
-        write_audit("lxc_action", f"{node}/{vmid}: {action}")
-        return jsonify(ok=True, task=task)
-    except Exception as exc:
-        return jsonify(error=str(exc)), 503
-
-
-@APP.post("/api/lxc/<node>/create")
-@admin_required
-def api_lxc_create(node):
-    body = request.get_json(silent=True) or {}
-    allowed = {
-        "vmid", "ostemplate", "hostname", "storage", "rootfs",
-        "memory", "swap", "cores", "password", "net0",
-        "unprivileged", "start",
-    }
-    data = {
-        key: value
-        for key, value in body.items()
-        if key in allowed and value not in ("", None)
-    }
-    try:
-        task = PVE.create_lxc(node, data)
-        write_audit("lxc_create", f"{node}: {data}")
-        return jsonify(ok=True, task=task)
-    except Exception as exc:
-        return jsonify(error=str(exc)), 503
-
-
-# =========================
-# User / role management
-# =========================
 
 @APP.get("/api/users")
-@admin_required
+@owner_required
 def api_users():
-    c = connection()
-    rows = c.execute(
-        "SELECT id,username,role,active,created_at FROM users ORDER BY id"
-    ).fetchall()
-    c.close()
-    return jsonify(users=[dict(x) for x in rows])
+    rows = db_all("SELECT * FROM users ORDER BY id ASC")
+    out = []
+    for row in rows:
+        item = public_user(row)
+        item["assignments"] = db_all(
+            "SELECT node, kind, vmid FROM assignments WHERE user_id=?", (row["id"],)
+        )
+        out.append(item)
+    return jsonify(users=out, signup_open=setting_get("signup_open", True))
 
 
 @APP.post("/api/users")
-@admin_required
+@owner_required
 def api_user_create():
     body = request.get_json(silent=True) or {}
     username = str(body.get("username", "")).strip().lower()
-    password = str(body.get("password", ""))
-
-    if len(username) < 3 or len(password) < 8:
-        return jsonify(error="Username/password is too short"), 400
-
-    c = connection()
+    password = str(body.get("password", "")) or random_password()
+    role = str(body.get("role", "user"))
+    if role not in ROLE_ORDER:
+        return jsonify(error="Unknown role"), 400
+    if len(username) < 3:
+        return jsonify(error="Username too short"), 400
     try:
-        c.execute(
-            "INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
+        uid = db_run(
+            "INSERT INTO users(username,email,password_hash,role,active,vm_limit,"
+            "note,created_at) VALUES(?,?,?,?,?,?,?,?)",
             (
                 username,
+                str(body.get("email", ""))[:120],
                 make_password(password),
-                "user",
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                role,
+                1,
+                safe_int(body.get("vm_limit"), 3),
+                str(body.get("note", ""))[:300],
+                now_iso(),
             ),
         )
-        c.commit()
     except sqlite3.IntegrityError:
-        c.close()
         return jsonify(error="Username already exists"), 409
-    c.close()
-
-    write_audit("user_created", username)
-    return jsonify(ok=True)
+    write_audit("user_create", username, role)
+    return jsonify(ok=True, id=uid, password=password)
 
 
 @APP.patch("/api/users/<int:uid>")
 @owner_required
 def api_user_update(uid):
-    if uid == 1:
-        return jsonify(error="Main Owner account is protected"), 403
-
     body = request.get_json(silent=True) or {}
-    changes = []
-    values = []
+    row = db_one("SELECT * FROM users WHERE id=?", (uid,))
+    if not row:
+        return jsonify(error="User not found"), 404
+    me = current_user()
+    if row["id"] == me["id"] and body.get("role") and body["role"] != "owner":
+        return jsonify(error="You cannot demote yourself"), 400
 
-    if "role" in body:
-        role = body["role"]
-        if role not in ("user", "admin"):
-            return jsonify(error="Role must be user or admin"), 400
-        changes.append("role=?")
-        values.append(role)
-
+    fields, params = [], []
+    if "role" in body and body["role"] in ROLE_ORDER:
+        fields.append("role=?")
+        params.append(body["role"])
     if "active" in body:
-        changes.append("active=?")
-        values.append(1 if body["active"] else 0)
-
-    if not changes:
-        return jsonify(ok=True)
-
-    values.append(uid)
-    c = connection()
-    c.execute(
-        "UPDATE users SET " + ",".join(changes) + " WHERE id=?",
-        values,
-    )
-    c.commit()
-    c.close()
-    write_audit("user_updated", f"id={uid}, changes={changes}")
+        fields.append("active=?")
+        params.append(1 if body["active"] else 0)
+    if "vm_limit" in body:
+        fields.append("vm_limit=?")
+        params.append(safe_int(body["vm_limit"], 3))
+    if "email" in body:
+        fields.append("email=?")
+        params.append(str(body["email"])[:120])
+    if "note" in body:
+        fields.append("note=?")
+        params.append(str(body["note"])[:300])
+    if body.get("password"):
+        new_password = str(body["password"])
+        if len(new_password) < 8:
+            return jsonify(error="Password must be at least 8 characters"), 400
+        fields.append("password_hash=?")
+        params.append(make_password(new_password))
+    if not fields:
+        return jsonify(error="Nothing to update"), 400
+    params.append(uid)
+    db_run("UPDATE users SET " + ", ".join(fields) + " WHERE id=?", params)
+    write_audit("user_update", row["username"], ", ".join(fields))
     return jsonify(ok=True)
 
 
-# =========================
-# Pandas data analysis
-# =========================
+@APP.delete("/api/users/<int:uid>")
+@owner_required
+def api_user_delete(uid):
+    me = current_user()
+    if me["id"] == uid:
+        return jsonify(error="You cannot delete your own account"), 400
+    row = db_one("SELECT * FROM users WHERE id=?", (uid,))
+    if not row:
+        return jsonify(error="User not found"), 404
+    db_run("DELETE FROM users WHERE id=?", (uid,))
+    write_audit("user_delete", row["username"])
+    return jsonify(ok=True)
 
-@APP.get("/api/analytics")
-@login_required
-def api_analytics():
+
+@APP.post("/api/users/<int:uid>/assign")
+@owner_required
+def api_user_assign(uid):
+    body = request.get_json(silent=True) or {}
+    node = str(body.get("node", "")).strip()
+    kind = "lxc" if str(body.get("kind")) == "lxc" else "qemu"
+    vmid = safe_int(body.get("vmid"))
+    if not node or not vmid:
+        return jsonify(error="node and vmid are required"), 400
     try:
-        nodes = enriched_nodes()
-        containers = all_containers(nodes)
-
-        node_df = pd.DataFrame(nodes)
-        lxc_df = pd.DataFrame(containers)
-
-        def mean_column(name):
-            if name not in node_df:
-                return 0
-            values = pd.to_numeric(
-                node_df[name], errors="coerce"
-            ).fillna(0)
-            return round(float(values.mean()), 1)
-
-        def max_column(name):
-            if name not in node_df:
-                return 0
-            values = pd.to_numeric(
-                node_df[name], errors="coerce"
-            ).fillna(0)
-            return round(float(values.max()), 1)
-
-        running = (
-            int((lxc_df["status"] == "running").sum())
-            if "status" in lxc_df
-            else 0
+        db_run(
+            "INSERT INTO assignments(user_id,node,kind,vmid,created_at) VALUES(?,?,?,?,?)",
+            (uid, node, kind, vmid, now_iso()),
         )
+    except sqlite3.IntegrityError:
+        return jsonify(error="Already assigned"), 409
+    write_audit("assign", "%s/%s/%s" % (node, kind, vmid), "user=%s" % uid)
+    return jsonify(ok=True)
 
-        risks = []
-        for _, row in node_df.iterrows():
-            flags = []
-            if float(row.get("cpu_pct", 0)) >= 80:
-                flags.append("CPU")
-            if float(row.get("mem_pct", 0)) >= 85:
-                flags.append("RAM")
-            if float(row.get("disk_pct", 0)) >= 85:
-                flags.append("Disk")
-            if flags:
-                risks.append(
-                    {"node": row.get("node"), "risks": flags}
-                )
 
+@APP.delete("/api/users/<int:uid>/assign")
+@owner_required
+def api_user_unassign(uid):
+    body = request.get_json(silent=True) or {}
+    db_run(
+        "DELETE FROM assignments WHERE user_id=? AND node=? AND kind=? AND vmid=?",
+        (
+            uid,
+            str(body.get("node", "")),
+            str(body.get("kind", "")),
+            safe_int(body.get("vmid")),
+        ),
+    )
+    write_audit("unassign", str(body.get("vmid")), "user=%s" % uid)
+    return jsonify(ok=True)
+
+
+@APP.post("/api/settings/signup")
+@owner_required
+def api_toggle_signup():
+    body = request.get_json(silent=True) or {}
+    value = bool(body.get("open"))
+    setting_set("signup_open", value)
+    write_audit("signup_toggle", "", str(value))
+    return jsonify(ok=True, signup_open=value)
+
+
+# ==============================================================================
+# SECTION 8 - REST API : CLUSTER, NODES, STORAGE, TASKS
+# ==============================================================================
+
+
+def visible_guests(user, guests):
+    allowed = assigned_pairs(user)
+    if allowed is None:
+        return guests
+    return [g for g in guests if (g["node"], g["kind"], g["vmid"]) in allowed]
+
+
+@APP.get("/api/cluster")
+@login_required
+def api_cluster():
+    user = current_user()
+    if not PVE.configured():
+        blank = {"nodes": [], "guests": [], "storages": []}
         return jsonify(
-            summary={
-                "nodes": len(nodes),
-                "containers": len(containers),
-                "avg_cpu": mean_column("cpu_pct"),
-                "avg_memory": mean_column("mem_pct"),
-                "avg_disk": mean_column("disk_pct"),
-                "peak_cpu": max_column("cpu_pct"),
-                "running": running,
-                "stopped": len(containers) - running,
-                "risk_nodes": len(risks),
-            },
-            node_rows=[
-                {
-                    "node": x["node"],
-                    "cpu": x["cpu_pct"],
-                    "memory": x["mem_pct"],
-                    "disk": x["disk_pct"],
-                }
-                for x in nodes
-            ],
-            risk_nodes=risks,
+            connected=False,
+            reason="Proxmox credentials are not configured on the server.",
+            nodes=[],
+            guests=[],
+            storages=[],
+            totals=compute_totals(blank),
+            analytics=analytics(blank),
         )
-    except Exception as exc:
-        return jsonify(error=str(exc)), 503
-
-
-# =========================
-# Modern frontend
-# =========================
-
-HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HyperVM — Proxmox LXC Manager</title>
-<link rel="icon" href="{{logo}}">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
-<style>
-:root{--bg:#050811;--panel:#0b1220;--panel2:#101a2c;--line:#1d2c45;--text:#edf4ff;--muted:#8294ae;--blue:#3b8cff;--purple:#7958ff;--green:#2ee39b;--red:#ff667d;--yellow:#f4c85b}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 450px at 15% -10%,#163b79 0,transparent 65%),radial-gradient(850px 500px at 100% 0,#281b64 0,transparent 65%),var(--bg);color:var(--text);font:14px Inter,system-ui,sans-serif}button,input,select{font:inherit}button{cursor:pointer}::-webkit-scrollbar{width:8px}::-webkit-scrollbar-thumb{background:#263957;border-radius:99px}
-.login{min-height:100vh;display:grid;place-items:center;padding:22px}.loginbox{width:min(430px,100%);padding:30px;border:1px solid var(--line);border-radius:25px;background:#0a1120f2;box-shadow:0 25px 80px #0009;backdrop-filter:blur(20px)}
-.brand{display:flex;align-items:center;gap:12px}.brand img{width:52px;height:52px;object-fit:contain}.brand b{font-size:26px}.brand small{display:block;color:var(--muted)}.tabs{display:grid;grid-template-columns:1fr 1fr;background:#070d17;border:1px solid var(--line);padding:4px;border-radius:10px;margin:25px 0 17px}.tabs button{border:0;background:transparent;color:var(--muted);padding:10px;border-radius:8px}.tabs .on{background:#17243b;color:white}
-.field{margin:13px 0}.field label{display:block;color:#879ab5;font-size:10px;text-transform:uppercase;letter-spacing:.09em;margin-bottom:7px}.field input,.field select{width:100%;padding:12px;background:#080e19;border:1px solid var(--line);color:white;border-radius:10px;outline:0}.field input:focus,.field select:focus{border-color:#418fff}.btn{padding:10px 13px;border-radius:9px;border:1px solid #2a3b59;background:#111d30;color:#fff}.btn:hover{filter:brightness(1.13)}.primary{border:0;background:linear-gradient(110deg,#318dff,#7756ff)}.notice{padding:12px;border:1px solid var(--line);border-radius:10px;background:#09111e;color:#91a3bc;font-size:12px;line-height:1.55}.error{border-color:#5d2d39;background:#201016;color:#ffadb9}.ok{border-color:#1c5b48;background:#09221b;color:#91f1cd}
-.layout{min-height:100vh;display:grid;grid-template-columns:248px 1fr}aside{height:100vh;position:sticky;top:0;padding:18px 14px;background:#070b13ed;border-right:1px solid var(--line);backdrop-filter:blur(20px)}aside .brand{padding:4px 8px 22px}.nav button{width:100%;border:0;background:transparent;color:#8799b3;text-align:left;padding:11px 12px;border-radius:9px;margin:2px 0}.nav button:hover,.nav .active{background:#132036;color:#fff}.section{font-size:10px;color:#536680;text-transform:uppercase;letter-spacing:.12em;margin:19px 11px 6px}.bottom{position:absolute;left:14px;right:14px;bottom:16px}.main{max-width:1650px;width:100%;margin:auto;padding:27px 31px}.head{display:flex;justify-content:space-between;gap:15px;align-items:center;margin-bottom:22px}.head h1{margin:0;font-size:29px}.sub{color:var(--muted);margin-top:5px}.identity{display:flex;align-items:center;gap:9px}.avatar{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font-weight:800;background:linear-gradient(135deg,var(--blue),var(--purple))}.badge{font-size:10px;padding:5px 9px;border-radius:99px;background:#17243a;color:#aec0d8}.badge.owner{background:#2d204b;color:#d5c2ff}.badge.admin{background:#10362d;color:#8df1c7}
-.grid{display:grid;gap:15px}.stats{grid-template-columns:repeat(4,1fr)}.two{grid-template-columns:1.4fr 1fr}.three{grid-template-columns:repeat(3,1fr)}.card{background:#0c1423e8;border:1px solid var(--line);border-radius:16px;padding:17px;box-shadow:0 8px 35px #0003}.card h3{margin:0 0 14px}.label{font-size:10px;color:#7e91ad;text-transform:uppercase;letter-spacing:.1em}.big{font-size:29px;font-weight:850;margin:7px 0}.tiny,.muted{color:var(--muted);font-size:11px}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px}.actions{display:flex;gap:7px;flex-wrap:wrap}.kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.mini{background:#080f1b;border:1px solid var(--line);border-radius:10px;padding:11px}.mini span{display:block;color:#71849f;font-size:10px}.mini b{font-size:19px;display:block;margin-top:4px}.progress{height:7px;background:#070e19;border-radius:99px;overflow:hidden}.progress i{display:block;height:100%;background:linear-gradient(90deg,#318cff,#7856ff);border-radius:99px}
-table{width:100%;border-collapse:collapse}th,td{padding:12px 9px;border-bottom:1px solid #18263c;text-align:left}th{font-size:10px;color:#71839e;text-transform:uppercase;letter-spacing:.09em}td{font-size:13px}.status{display:inline-flex;align-items:center;gap:6px}.dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px #2ee39a99}.dot.off{background:#5e6e85;box-shadow:none}.green{color:#82f0c4}.danger{color:#ff9ba9}.lxcgrid{grid-template-columns:repeat(3,1fr)}.lxc .row{display:flex;justify-content:space-between;margin:10px 0}.chart{height:280px}.empty{text-align:center;padding:42px;color:#71839e}.modalback{position:fixed;z-index:50;inset:0;background:#000c;display:grid;place-items:center;padding:20px}.modal{width:min(620px,100%);max-height:90vh;overflow:auto;background:#0d1626;border:1px solid var(--line);border-radius:18px;padding:21px;box-shadow:0 25px 80px #000}.toast{position:fixed;z-index:100;right:20px;bottom:20px;background:#111d31;border:1px solid var(--line);border-radius:10px;padding:12px 15px;box-shadow:0 15px 50px #0009}
-@media(max-width:1100px){.stats,.lxcgrid{grid-template-columns:repeat(2,1fr)}.two{grid-template-columns:1fr}}@media(max-width:720px){.layout{display:block}aside{height:auto;position:relative;border-right:0;border-bottom:1px solid var(--line)}.nav{display:flex;overflow:auto}.nav button{width:auto;white-space:nowrap}.section{display:none}.bottom{position:static;margin-top:8px}.main{padding:17px 13px}.stats,.lxcgrid,.three,.kpis{grid-template-columns:1fr}.head{align-items:flex-start;flex-direction:column}}
-</style>
-</head>
-<body>
-<div id="root"></div>
-<script>
-let ME=null,CL={nodes:[],containers:[]},charts=[];
-const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const toast=m=>{const x=document.createElement("div");x.className="toast";x.textContent=m;document.body.appendChild(x);setTimeout(()=>x.remove(),2600)};
-const api=async(u,o={})=>{const r=await fetch(u,{credentials:"same-origin",...o,headers:{"Content-Type":"application/json",...(o.headers||{})}});const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||"Request failed");return d};
-const bytes=n=>{n=+n||0;for(const u of["B","KB","MB","GB","TB"]){if(n<1024)return n.toFixed(n<10?1:0)+" "+u;n/=1024}return n.toFixed(1)+" PB"};
-function modal(s){const x=document.createElement("div");x.className="modalback";x.id="modal";x.innerHTML='<div class="modal">'+s+"</div>";document.body.appendChild(x)}
-function closeModal(){document.getElementById("modal")?.remove()}
-function stat(a,b,c){return `<div class="card"><div class="label">${a}</div><div class="big">${b}</div><div class="tiny">${c}</div></div>`}
-function mini(a,b){return `<div class="mini"><span>${a}</span><b>${b}</b></div>`}
-function auth(mode="login"){
-root.innerHTML=`<div class="login"><div class="loginbox"><div class="brand"><img src="{{logo}}"><div><b>HyperVM</b><small>Real Proxmox LXC Manager</small></div></div><div class="tabs"><button class="${mode==="login"?"on":""}" onclick="auth('login')">Sign in</button><button class="${mode==="signup"?"on":""}" onclick="auth('signup')">Sign up</button></div><form id="af"><div class="field"><label>Username</label><input id="u" required></div><div class="field"><label>Password</label><input id="p" type="password" required></div>${mode==="signup"?'<div class="field"><label>Confirm password</label><input id="p2" type="password" required></div>':""}<button class="btn primary" style="width:100%">${mode==="login"?"Sign in":"Create account"}</button></form>${mode==="login"?'<div class="notice" style="margin-top:14px"><b>Initial Owner</b><br>admin / admin123<br><br>Change it immediately after first login.</div>':""}<div class="notice" style="margin-top:10px">No email verification. Accounts are stored server-side in SQLite.</div></div></div>`;
-af.onsubmit=async e=>{e.preventDefault();try{const name=u.value.trim(),pw=p.value;if(mode==="signup"){if(pw!==p2.value)throw Error("Passwords do not match");ME=(await api("/api/auth/signup",{method:"POST",body:JSON.stringify({username:name,password:pw})})).user}else ME=(await api("/api/auth/login",{method:"POST",body:JSON.stringify({username:name,password:pw})})).user;dashboard()}catch(err){toast(err.message)}}
-}
-function shell(active,title,sub,html){
-root.innerHTML=`<div class="layout"><aside><div class="brand"><img src="{{logo}}"><div><b>HyperVM</b><small>Proxmox Console</small></div></div><div class="nav"><div class="section">Workspace</div><button class="${active==="dashboard"?"active":""}" onclick="dashboard()">▦ &nbsp; Dashboard</button><button class="${active==="lxc"?"active":""}" onclick="lxcs()">□ &nbsp; LXC Containers</button><button class="${active==="nodes"?"active":""}" onclick="nodes()">◈ &nbsp; Proxmox Nodes</button><div class="section">Insights</div><button class="${active==="analytics"?"active":""}" onclick="analytics()">◒ &nbsp; Data Analysis</button>${ME.role!=="user"?'<div class="section">Administration</div><button class="'+(active==="users"?"active":"")+'" onclick="users()">♙ &nbsp; Users & Roles</button>':""}<button class="${active==="settings"?"active":""}" onclick="settings()">⚙ &nbsp; Settings</button></div><div class="bottom"><button class="btn" style="width:100%" onclick="logout()">⇥ &nbsp; Sign out</button></div></aside><main class="main"><div class="head"><div><h1>${title}</h1><div class="sub">${sub}</div></div><div class="identity"><span>${esc(ME.username)}</span><span class="badge ${ME.role}">${esc(ME.role)}</span><span class="avatar">${esc(ME.username[0].toUpperCase())}</span></div></div>${html}</main></div>`
-}
-function fail(e){return `<div class="card error"><b>Proxmox API unavailable</b><p>${esc(e.message)}</p><p class="tiny">Configure PROXMOX_URL, PROXMOX_TOKEN_ID and PROXMOX_TOKEN_SECRET on the Python server.</p><button class="btn primary" onclick="settings()">Open Settings</button></div>`}
-async function loadCluster(){CL=await api("/api/cluster");return CL}
-async function dashboard(){
-try{
-await loadCluster();const n=CL.nodes,c=CL.containers,r=c.filter(x=>x.status==="running").length;
-const cpu=n.length?Math.round(n.reduce((a,x)=>a+x.cpu_pct,0)/n.length):0;
-const ram=n.length?Math.round(n.reduce((a,x)=>a+x.mem_pct,0)/n.length):0;
-shell("dashboard","Dashboard","Live Proxmox infrastructure and LXC health",
-`<div class="grid stats">${stat("Proxmox nodes",n.length,"Live API result")}${stat("LXC containers",c.length,r+" running")}${stat("Average CPU",cpu+"%","Across nodes")}${stat("Average RAM",ram+"%","Across nodes")}</div><div class="grid two" style="margin-top:15px"><div class="card"><div class="toolbar"><h3>Cluster utilization</h3><button class="btn" onclick="analytics()">Analyze</button></div><div class="chart"><canvas id="mainChart"></canvas></div></div><div class="card"><h3>Node health</h3>${n.length?n.map(x=>`<div style="margin:15px 0"><div class="toolbar"><b>${esc(x.node)}</b><span class="status"><i class="dot"></i>${esc(x.status||"online")}</span></div><div class="tiny">CPU ${x.cpu_pct}% · RAM ${x.mem_pct}% · Disk ${x.disk_pct}%</div><div class="progress" style="margin-top:7px"><i style="width:${x.cpu_pct}%"></i></div></div>`).join(""):"<div class='empty'>No nodes.</div>"}</div></div><div class="card" style="margin-top:15px"><div class="toolbar"><h3>Recent LXC inventory</h3><button class="btn" onclick="lxcs()">Manage</button></div>${table(c.slice(0,10))}</div>`);
-drawMain(n)
-}catch(e){shell("dashboard","Dashboard","Connection status",fail(e))}
-}
-function drawMain(n){
-charts.forEach(c=>c.destroy());charts=[];
-if(!window.Chart)return;
-charts.push(new Chart(document.getElementById("mainChart"),{type:"bar",data:{labels:n.map(x=>x.node),datasets:[{label:"CPU %",data:n.map(x=>x.cpu_pct),borderRadius:6},{label:"RAM %",data:n.map(x=>x.mem_pct),borderRadius:6},{label:"Disk %",data:n.map(x=>x.disk_pct),borderRadius:6}]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{min:0,max:100,grid:{color:"#18263b"},ticks:{color:"#8294ae"}},x:{grid:{display:false},ticks:{color:"#8294ae"}}},plugins:{legend:{labels:{color:"#9db0c9"}}}}}))
-}
-function table(a){
-if(!a.length)return"<div class='empty'>No LXC containers.</div>";
-return`<table><thead><tr><th>VMID</th><th>Name</th><th>Node</th><th>Status</th><th>CPU</th><th>RAM</th><th></th></tr></thead><tbody>${a.map(x=>`<tr><td>${x.vmid}</td><td><b>${esc(x.name||"CT "+x.vmid)}</b></td><td>${esc(x.node)}</td><td><span class="status"><i class="dot ${x.status==="running"?"":"off"}"></i>${esc(x.status)}</span></td><td>${x.cpu_pct}%</td><td>${x.mem_mb} MB</td><td><button class="btn" onclick="detail('${esc(x.node)}',${x.vmid})">Details</button></td></tr>`).join("")}</tbody></table>`
-}
-async function lxcs(){try{await loadCluster();renderLxcs(CL.containers)}catch(e){shell("lxc","LXC Containers","Live Proxmox inventory",fail(e))}}
-function renderLxcs(a){
-shell("lxc","LXC Containers","Real start, shutdown, reboot and provisioning controls",
-`<div class="toolbar"><input id="search" class="field" style="max-width:310px;margin:0" placeholder="Search VMID, name, node..." oninput="filterLxcs()"><div class="actions"><button class="btn" onclick="lxcs()">↻ Refresh</button>${ME.role!=="user"?'<button class="btn primary" onclick="createModal()">+ Create LXC</button>':""}</div></div><div id="cards" class="grid lxcgrid" style="margin-top:15px">${cards(a)}</div>`)
-}
-function cards(a){
-if(!a.length)return"<div class='card empty' style='grid-column:1/-1'>No containers found.</div>";
-return a.map(x=>`<div class="card lxc"><div class="toolbar"><div><b>${esc(x.name||"CT "+x.vmid)}</b><div class="tiny">VMID ${x.vmid} · ${esc(x.node)}</div></div><span class="status"><i class="dot ${x.status==="running"?"":"off"}"></i>${esc(x.status)}</span></div><div class="row"><span class="muted">CPU</span><b>${x.cpu_pct}%</b></div><div class="progress"><i style="width:${Math.min(100,x.cpu_pct)}%"></i></div><div class="row"><span class="muted">Memory</span><b>${x.mem_mb} MB</b></div><div class="row"><span class="muted">Disk</span><b>${x.disk_gb} GB</b></div><div class="actions">${x.status==="running"?`<button class="btn danger" onclick="action('${esc(x.node)}',${x.vmid},'shutdown')">Shutdown</button><button class="btn" onclick="action('${esc(x.node)}',${x.vmid},'reboot')">Reboot</button>`:`<button class="btn green" onclick="action('${esc(x.node)}',${x.vmid},'start')">Start</button>`}<button class="btn" onclick="detail('${esc(x.node)}',${x.vmid})">Details</button></div></div>`).join("")
-}
-function filterLxcs(){const q=search.value.toLowerCase();document.getElementById("cards").innerHTML=cards(CL.containers.filter(x=>(x.vmid+" "+x.name+" "+x.node+" "+x.status).toLowerCase().includes(q)))}
-async function action(n,id,a){try{await api(`/api/lxc/${encodeURIComponent(n)}/${id}/${a}`,{method:"POST"});toast(a+" task submitted");setTimeout(lxcs,900)}catch(e){toast(e.message)}}
-async function detail(n,id){
-try{const d=await api(`/api/lxc/${encodeURIComponent(n)}/${id}`);modal(`<h2>Container ${id}</h2><p class="muted">${esc(n)}</p><h3>Status</h3><pre>${esc(JSON.stringify(d.status,null,2))}</pre><h3>Configuration</h3><pre>${esc(JSON.stringify(d.config,null,2))}</pre><div class="actions" style="justify-content:flex-end"><button class="btn" onclick="closeModal()">Close</button></div>`)}catch(e){toast(e.message)}
-}
-function createModal(){
-modal(`<h2>Create LXC</h2><div class="notice">This sends a real Proxmox POST request using the server-side API token.</div><div class="field"><label>Node</label><select id="cn">${CL.nodes.map(x=>`<option>${esc(x.node)}</option>`).join("")}</select></div><div class="field"><label>VMID</label><input id="vmid" type="number"></div><div class="field"><label>Hostname</label><input id="hostname" placeholder="hypervm-101"></div><div class="field"><label>Template</label><input id="template" placeholder="local:vztmpl/debian-12-standard_*.tar.zst"></div><div class="field"><label>Storage</label><input id="storage" value="local-lvm"></div><div class="field"><label>Root disk GB</label><input id="root" type="number" value="8"></div><div class="field"><label>Memory MB</label><input id="memory" type="number" value="1024"></div><div class="field"><label>CPU cores</label><input id="cores" type="number" value="1"></div><div class="actions" style="justify-content:flex-end"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" onclick="createLxc()">Create</button></div>`)
-}
-async function createLxc(){
-try{const b={hostname:hostname.value,ostemplate:template.value,storage:storage.value,rootfs:`${storage.value}:${+root.value}`,memory:+memory.value,cores:+cores.value};if(vmid.value)b.vmid=+vmid.value;await api(`/api/lxc/${encodeURIComponent(cn.value)}/create`,{method:"POST",body:JSON.stringify(b)});closeModal();toast("Creation task submitted");setTimeout(lxcs,1000)}catch(e){toast(e.message)}
-}
-async function nodes(){
-try{const d=await api("/api/nodes");shell("nodes","Proxmox Nodes","Live capacity and resource pressure",`<div class="grid three">${d.nodes.map(x=>`<div class="card"><div class="toolbar"><h3>${esc(x.node)}</h3><span class="status"><i class="dot"></i>${esc(x.status)}</span></div><p class="tiny">CPU ${x.cpu_pct}%</p><div class="progress"><i style="width:${x.cpu_pct}%"></i></div><p class="tiny">RAM ${x.mem_pct}% · ${bytes(x.mem_used)} / ${bytes(x.mem_total)}</p><div class="progress"><i style="width:${x.mem_pct}%"></i></div><p class="tiny">Disk ${x.disk_pct}% · ${bytes(x.disk_used)} / ${bytes(x.disk_total)}</p><div class="progress"><i style="width:${x.disk_pct}%"></i></div><p class="tiny">Uptime ${x.uptime_hours} hours</p></div>`).join("")}</div>`)}catch(e){shell("nodes","Proxmox Nodes","Connection status",fail(e))}
-}
-async function analytics(){
-try{
-const d=await api("/api/analytics"),s=d.summary;
-shell("analytics","Data Analysis","Pandas-powered analysis of the live Proxmox snapshot",
-`<div class="grid stats">${stat("Average CPU",s.avg_cpu+"%","Mean across nodes")}${stat("Peak CPU",s.peak_cpu+"%","Maximum node")}${stat("Running LXC",s.running,"Current state")}${stat("Risk nodes",s.risk_nodes,"Threshold flags")}</div><div class="grid two" style="margin-top:15px"><div class="card"><div class="toolbar"><h3>Resource comparison</h3><span class="tiny">live snapshot</span></div><div class="chart"><canvas id="analysisChart"></canvas></div></div><div class="card"><h3>Capacity findings</h3><div class="kpis">${mini("Nodes",s.nodes)}${mini("Containers",s.containers)}${mini("Stopped",s.stopped)}</div>${d.risk_nodes.length?`<div class="notice error" style="margin-top:14px"><b>Attention</b><br>${d.risk_nodes.map(x=>esc(x.node)+" — "+x.risks.join(", ")).join("<br>")}</div>`:`<div class="notice ok" style="margin-top:14px">No node crossed the high-utilization thresholds.</div>`}<div class="notice" style="margin-top:10px">Calculations are performed by pandas on the Python server from the current Proxmox API snapshot.</div></div></div>`);
-charts.forEach(c=>c.destroy());charts=[];charts.push(new Chart(document.getElementById("analysisChart"),{type:"bar",data:{labels:d.node_rows.map(x=>x.node),datasets:[{label:"CPU %",data:d.node_rows.map(x=>x.cpu),borderRadius:6},{label:"RAM %",data:d.node_rows.map(x=>x.memory),borderRadius:6},{label:"Disk %",data:d.node_rows.map(x=>x.disk),borderRadius:6}]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{min:0,max:100},x:{grid:{display:false}}}}}))
-}catch(e){shell("analytics","Data Analysis","Connection status",fail(e))}
-}
-async function users(){
-try{const d=await api("/api/users");shell("users","Users & Roles","The Owner controls promotions; promoted accounts display Admin",
-`<div class="card"><div class="toolbar"><h3>HyperVM accounts</h3><button class="btn primary" onclick="newUser()">+ Add user</button></div><table><thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead><tbody>${d.users.map(u=>`<tr><td><b>${esc(u.username)}</b>${u.id===ME.id?" <span class='muted'>(you)</span>":""}</td><td><span class="badge ${u.role}">${esc(u.role)}</span></td><td>${u.active?"Active":"Disabled"}</td><td>${esc(u.created_at)}</td><td>${u.id===1?"<span class='muted'>Protected Owner</span>":`<button class="btn" onclick="role(${u.id},'${u.role==="admin"?"user":"admin"}')">${u.role==="admin"?"Demote":"Promote to Admin"}</button> <button class="btn" onclick="toggleUser(${u.id},${!u.active})">${u.active?"Disable":"Enable"}</button>`}</td></tr>`).join("")}</tbody></table></div>`)}catch(e){toast(e.message)}
-}
-function newUser(){modal(`<h2>Create user</h2><div class="field"><label>Username</label><input id="nu"></div><div class="field"><label>Password</label><input id="np" type="password"></div><div class="actions" style="justify-content:flex-end"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" onclick="saveUser()">Create</button></div>`)}
-async function saveUser(){try{await api("/api/users",{method:"POST",body:JSON.stringify({username:nu.value,password:np.value})});closeModal();users();toast("User created")}catch(e){toast(e.message)}}
-async function role(id,r){try{await api("/api/users/"+id,{method:"PATCH",body:JSON.stringify({role:r})});users();toast("Role updated")}catch(e){toast(e.message)}}
-async function toggleUser(id,v){try{await api("/api/users/"+id,{method:"PATCH",body:JSON.stringify({active:v})});users();toast("User updated")}catch(e){toast(e.message)}}
-function settings(){
-shell("settings","Settings","Server-side Proxmox connection and account security",
-`<div class="grid two"><div class="card"><h3>Proxmox connection</h3><div class="notice">The Proxmox token lives only in the Python process environment. It is never exposed to browser JavaScript.</div><div class="field"><label>PROXMOX_URL</label><input disabled value="Configured on Python server"></div><div class="field"><label>PROXMOX_TOKEN_ID</label><input disabled value="Configured on Python server"></div><div class="field"><label>TLS verification</label><input disabled value="PROXMOX_VERIFY_TLS environment variable"></div><p class="tiny">Use a dedicated least-privilege API token for production.</p></div><div class="card"><h3>Change password</h3><form id="pw"><div class="field"><label>Current password</label><input id="oldpw" type="password" required></div><div class="field"><label>New password</label><input id="newpw" type="password" required></div><div class="field"><label>Confirm</label><input id="newpw2" type="password" required></div><button class="btn primary">Change password</button></form></div></div><div class="card" style="margin-top:15px"><h3>Deployment</h3><pre>pip install flask requests pandas
-set PROXMOX_URL=https://YOUR-PROXMOX:8006
-set PROXMOX_TOKEN_ID=USER@pam!TOKEN
-set PROXMOX_TOKEN_SECRET=TOKEN_SECRET
-set PROXMOX_VERIFY_TLS=false
-python hypervm.py</pre></div>`);
-pw.onsubmit=async e=>{e.preventDefault();try{if(newpw.value!==newpw2.value)throw Error("Passwords do not match");await api("/api/auth/password",{method:"PATCH",body:JSON.stringify({current:oldpw.value,next:newpw.value})});toast("Password changed")}catch(e){toast(e.message)}}
-}
-async function logout(){await api("/api/auth/logout",{method:"POST"}).catch(()=>{});ME=null;auth()}
-async function boot(){try{const d=await api("/api/auth/me");if(d.user){ME=d.user;dashboard()}else auth()}catch(e){auth()}}
-boot();
-</script>
-</body>
-</html>
-"""
-
-@APP.get("/")
-def index():
-    return render_template_string(HTML, logo=LOGO)
-
-
-@APP.get("/health")
-def health():
+    snapshot = fleet_snapshot(force=request.args.get("force") == "1")
+    guests = visible_guests(user, snapshot["guests"])
+    scoped = {
+        "nodes": snapshot["nodes"],
+        "guests": guests,
+        "storages": snapshot["storages"],
+    }
     return jsonify(
-        ok=True,
-        proxmox_configured=PVE.configured(),
-        database=DB,
+        connected=True,
+        generated_at=snapshot["generated_at"],
+        nodes=snapshot["nodes"],
+        guests=guests,
+        storages=snapshot["storages"],
+        totals=compute_totals(scoped),
+        analytics=analytics(scoped),
     )
 
 
-if __name__ == "__main__":
-    init_db()
-    print()
-    print("HyperVM — Real Proxmox LXC Manager")
-    print("URL: http://127.0.0.1:" + str(PORT))
-    print("Default Owner: admin / admin123")
-    print("Proxmox configured:", PVE.configured())
-    print()
-    APP.run(host=HOST, port=PORT, debug=False)
+@APP.get("/api/nodes")
+@login_required
+def api_nodes():
+    return jsonify(nodes=[enrich_node(n) for n in PVE.nodes()])
+
+
+@APP.get("/api/nodes/<node>/status")
+@admin_required
+def api_node_status(node):
+    return jsonify(status=PVE.node_status(node))
+
+
+@APP.get("/api/nodes/<node>/rrd")
+@login_required
+def api_node_rrd(node):
+    return jsonify(series=PVE.node_rrd(node, request.args.get("timeframe", "hour")))
+
+
+@APP.get("/api/nodes/<node>/networks")
+@admin_required
+def api_node_networks(node):
+    return jsonify(networks=PVE.node_networks(node))
+
+
+@APP.get("/api/nodes/<node>/storage")
+@admin_required
+def api_node_storage(node):
+    return jsonify(storage=PVE.node_storage(node))
+
+
+@APP.get("/api/nodes/<node>/templates")
+@admin_required
+def api_node_templates(node):
+    return jsonify(templates=PVE.templates(node), suggested=DEFAULT_LXC_TEMPLATES)
+
+
+@APP.get("/api/nodes/<node>/isos")
+@admin_required
+def api_node_isos(node):
+    return jsonify(isos=PVE.isos(node))
+
+
+@APP.get("/api/tasks")
+@login_required
+def api_tasks():
+    node = request.args.get("node")
+    if node:
+        return jsonify(tasks=PVE.node_tasks(node, safe_int(request.args.get("limit"), 60)))
+    try:
+        return jsonify(tasks=PVE.cluster_tasks())
+    except ProxmoxError:
+        tasks = []
+        for item in PVE.nodes():
+            try:
+                tasks.extend(PVE.node_tasks(item["node"], 30))
+            except ProxmoxError:
+                continue
+        return jsonify(tasks=tasks)
+
+
+@APP.get("/api/tasks/<node>/<path:upid>/log")
+@admin_required
+def api_task_log(node, upid):
+    return jsonify(log=PVE.task_log(node, upid), status=PVE.task_status(node, upid))
+
+
+@APP.get("/api/nextid")
+@admin_required
+def api_nextid():
+    return jsonify(vmid=PVE.next_id())
+
+
+# ==============================================================================
+# SECTION 9 - REST API : GUEST LIFECYCLE (LXC + QEMU share these routes)
+# ==============================================================================
+
+
+def _guard(kind, node, vmid, level="user"):
+    user = current_user()
+    if not user:
+        raise ProxmoxError("Authentication required", 401)
+    if not role_at_least(user, "admin") and not guest_allowed(user, node, kind, vmid):
+        raise ProxmoxError("You do not have access to this guest", 403)
+    if level != "user" and not role_at_least(user, level):
+        raise ProxmoxError("Insufficient role for this operation", 403)
+    return user
+
+
+@APP.get("/api/guests")
+@login_required
+def api_guests():
+    snapshot = fleet_snapshot()
+    guests = visible_guests(current_user(), snapshot["guests"])
+    kind = request.args.get("kind")
+    if kind in ("lxc", "qemu"):
+        guests = [g for g in guests if g["kind"] == kind]
+    node = request.args.get("node")
+    if node:
+        guests = [g for g in guests if g["node"] == node]
+    search = (request.args.get("q") or "").strip().lower()
+    if search:
+        guests = [
+            g for g in guests
+            if search in str(g["name"]).lower() or search in str(g["vmid"])
+        ]
+    return jsonify(guests=guests)
+
+
+@APP.get("/api/guest/<kind>/<node>/<int:vmid>")
+@login_required
+def api_guest_detail(kind, node, vmid):
+    _guard(kind, node, vmid)
+    detail = {
+        "status": PVE.guest_status(node, kind, vmid),
+        "config": PVE.guest_config(node, kind, vmid),
+    }
+    try:
+        detail["snapshots"] = PVE.guest_snapshots(node, kind, vmid)
+    except ProxmoxError:
+        detail["snapshots"] = []
+    try:
+        detail["rrd"] = PVE.guest_rrd(
+            node, kind, vmid, request.args.get("timeframe", "hour")
+        )
+    except ProxmoxError:
+        detail["rrd"] = []
+    detail["kind"] = kind
+    detail["node"] = node
+    detail["vmid"] = vmid
+    return jsonify(detail)
+
+
+@APP.post("/api/guest/<kind>/<node>/<int:vmid>/action/<action>")
+@login_required
+def api_guest_action(kind, node, vmid, action):
+    _guard(kind, node, vmid)
+    result = PVE.guest_action(node, kind, vmid, action)
+    CACHE.drop("fleet")
+    write_audit("guest_%s" % action, "%s/%s/%s" % (node, kind, vmid), str(result))
+    return jsonify(ok=True, task=result)
+
+
+@APP.patch("/api/guest/<kind>/<node>/<int:vmid>/config")
+@admin_required
+def api_guest_config_update(kind, node, vmid):
+    body = request.get_json(silent=True) or {}
+    payload = {}
+    for key in (
+        "cores", "memory", "swap", "name", "hostname", "description",
+        "onboot", "tags", "cpulimit", "cpuunits",
+    ):
+        if key in body and body[key] not in ("", None):
+            payload[key] = body[key]
+    if not payload:
+        return jsonify(error="Nothing to change"), 400
+    result = PVE.guest_set_config(node, kind, vmid, payload)
+    CACHE.drop("fleet")
+    write_audit("guest_reconfigure", "%s/%s/%s" % (node, kind, vmid), json.dumps(payload))
+    return jsonify(ok=True, result=result)
+
+
+@APP.post("/api/guest/<kind>/<node>/<int:vmid>/resize")
+@admin_required
+def api_guest_resize(kind, node, vmid):
+    body = request.get_json(silent=True) or {}
+    disk = str(body.get("disk") or ("rootfs" if kind == "lxc" else "scsi0"))
+    size = str(body.get("size") or "+1G")
+    result = PVE.guest_resize(node, kind, vmid, disk, size)
+    write_audit("guest_resize", "%s/%s/%s" % (node, kind, vmid), "%s %s" % (disk, size))
+    return jsonify(ok=True, task=result)
+
+
+@APP.delete("/api/guest/<kind>/<node>/<int:vmid>")
+@admin_required
+def api_guest_delete(kind, node, vmid):
+    status = {}
+    try:
+        status = PVE.guest_status(node, kind, vmid) or {}
+    except ProxmoxError:
+        pass
+    if status.get("status") == "running":
+        try:
+            PVE.guest_action(node, kind, vmid, "stop")
+            time.sleep(3)
+        except ProxmoxError as exc:
+            LOG.warning("stop before delete failed: %s", exc)
+    result = PVE.guest_delete(node, kind, vmid, purge=True)
+    db_run("DELETE FROM assignments WHERE node=? AND kind=? AND vmid=?", (node, kind, vmid))
+    CACHE.drop("fleet")
+    write_audit("guest_delete", "%s/%s/%s" % (node, kind, vmid))
+    return jsonify(ok=True, task=result)
+
+
+@APP.post("/api/guest/<kind>/<node>/<int:vmid>/clone")
+@admin_required
+def api_guest_clone(kind, node, vmid):
+    body = request.get_json(silent=True) or {}
+    newid = safe_int(body.get("newid")) or PVE.next_id()
+    result = PVE.guest_clone(
+        node, kind, vmid, newid, body.get("name"), bool(body.get("full", True))
+    )
+    CACHE.drop("fleet")
+    write_audit("guest_clone", "%s/%s/%s" % (node, kind, vmid), "-> %s" % newid)
+    return jsonify(ok=True, newid=newid, task=result)
+
+
+@APP.post("/api/guest/<kind>/<node>/<int:vmid>/migrate")
+@admin_required
+def api_guest_migrate(kind, node, vmid):
+    body = request.get_json(silent=True) or {}
+    target = str(body.get("target", "")).strip()
+    if not target:
+        return jsonify(error="target node is required"), 400
+    result = PVE.guest_migrate(node, kind, vmid, target, bool(body.get("online", True)))
+    CACHE.drop("fleet")
+    write_audit("guest_migrate", "%s/%s/%s" % (node, kind, vmid), "-> %s" % target)
+    return jsonify(ok=True, task=result)
+
+
+@APP.get("/api/guest/<kind>/<node>/<int:vmid>/snapshots")
+@login_required
+def api_snapshots(kind, node, vmid):
+    _guard(kind, node, vmid)
+    return jsonify(snapshots=PVE.guest_snapshots(node, kind, vmid))
+
+
+@APP.post("/api/guest/<kind>/<node>/<int:vmid>/snapshots")
+@admin_required
+def api_snapshot_create(kind, node, vmid):
+    body = request.get_json(silent=True) or {}
+    name = slugify(
+        body.get("name") or ("snap-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+    )
+    result = PVE.guest_snapshot_create(
+        node, kind, vmid, name, str(body.get("description", ""))[:200]
+    )
+    write_audit("snapshot_create", "%s/%s/%s" % (node, kind, vmid), name)
+    return jsonify(ok=True, name=name, task=result)
+
+
+@APP.delete("/api/guest/<kind>/<node>/<int:vmid>/snapshots/<name>")
+@admin_required
+def api_snapshot_delete(kind, node, vmid, name):
+    result = PVE.guest_snapshot_delete(node, kind, vmid, name)
+    write_audit("snapshot_delete", "%s/%s/%s" % (node, kind, vmid), name)
+    return jsonify(ok=True, task=result)
+
+
+@APP.post("/api/guest/<kind>/<node>/<int:vmid>/snapshots/<name>/rollback")
+@admin_required
+def api_snapshot_rollback(kind, node, vmid, name):
+    result = PVE.guest_snapshot_rollback(node, kind, vmid, name)
+    write_audit("snapshot_rollback", "%s/%s/%s" % (node, kind, vmid), name)
+    return jsonify(ok=True, task=result)
+
+
+@APP.post("/api/guest/<kind>/<node>/<int:vmid>/backup")
+@admin_required
+def api_backup(kind, node, vmid):
+    body = request.get_json(silent=True) or {}
+    storage = str(body.get("storage") or "local")
+    result = PVE.guest_backup(
+        node, kind, vmid, storage, str(body.get("mode", "snapshot"))
+    )
+    write_audit("backup", "%s/%s/%s" % (node, kind, vmid), storage)
+    return jsonify(ok=True, task=result)
+
+
+# ==============================================================================
+# SECTION 10 - REST API : PROVISIONING
+# ==============================================================================
+
+
+def build_net0(body):
+    bridge = str(body.get("bridge") or "vmbr0")
+    ip = str(body.get("ip") or "dhcp").strip()
+    parts = ["name=eth0", "bridge=" + bridge]
+    if str(body.get("firewall", "")).lower() in ("1", "true", "on", "yes"):
+        parts.append("firewall=1")
+    if body.get("vlan"):
+        parts.append("tag=%d" % safe_int(body["vlan"]))
+    if ip and ip.lower() != "dhcp":
+        parts.append("ip=" + ip)
+        if body.get("gateway"):
+            parts.append("gw=" + str(body["gateway"]))
+    else:
+        parts.append("ip=dhcp")
+    if body.get("rate"):
+        parts.append("rate=%s" % safe_int(body["rate"]))
+    return ",".join(parts)
+
+
+@APP.post("/api/create/lxc")
+@admin_required
+def api_create_lxc():
+    body = request.get_json(silent=True) or {}
+    node = str(body.get("node", "")).strip()
+    if not node:
+        return jsonify(error="node is required"), 400
+
+    vmid = safe_int(body.get("vmid")) or PVE.next_id()
+    password = str(body.get("password") or "") or random_password()
+    hostname = slugify(body.get("hostname") or ("ct-%s" % vmid))
+    template = str(body.get("template", "")).strip()
+    if not template:
+        return jsonify(error="A container template (ostemplate) is required"), 400
+    storage = str(body.get("storage") or "local-lvm")
+
+    payload = {
+        "vmid": vmid,
+        "hostname": hostname,
+        "ostemplate": template,
+        "storage": storage,
+        "rootfs": "%s:%d" % (storage, safe_int(body.get("disk"), 8)),
+        "cores": safe_int(body.get("cores"), 1),
+        "memory": safe_int(body.get("memory"), 1024),
+        "swap": safe_int(body.get("swap"), 512),
+        "password": password,
+        "net0": build_net0(body),
+        "unprivileged": 1 if body.get("unprivileged", True) else 0,
+        "features": "nesting=1" if body.get("nesting", True) else "",
+        "onboot": 1 if body.get("onboot", True) else 0,
+        "start": 1 if body.get("start", True) else 0,
+    }
+    if body.get("ostype") in OS_TYPES:
+        payload["ostype"] = body["ostype"]
+    if body.get("nameserver"):
+        payload["nameserver"] = str(body["nameserver"])
+    if body.get("sshkeys"):
+        payload["ssh-public-keys"] = str(body["sshkeys"])
+    if body.get("description"):
+        payload["description"] = str(body["description"])[:500]
+    if body.get("tags"):
+        payload["tags"] = slugify(body["tags"], "hypervm")
+    payload = dict((k, v) for k, v in payload.items() if v not in ("", None))
+
+    task = PVE.create_lxc(node, payload)
+    CACHE.drop("fleet")
+    write_audit("create_lxc", "%s/lxc/%s" % (node, vmid), hostname)
+
+    if body.get("owner_id"):
+        try:
+            db_run(
+                "INSERT OR IGNORE INTO assignments(user_id,node,kind,vmid,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (safe_int(body["owner_id"]), node, "lxc", vmid, now_iso()),
+            )
+        except Exception as exc:
+            LOG.debug("assign after create failed: %s", exc)
+
+    return jsonify(ok=True, vmid=vmid, password=password, hostname=hostname, task=task)
+
+
+@APP.post("/api/create/qemu")
+@admin_required
+def api_create_qemu():
+    body = request.get_json(silent=True) or {}
+    node = str(body.get("node", "")).strip()
+    if not node:
+        return jsonify(error="node is required"), 400
+
+    vmid = safe_int(body.get("vmid")) or PVE.next_id()
+    name = slugify(body.get("name") or ("vm-%s" % vmid))
+    storage = str(body.get("storage") or "local-lvm")
+    disk_gb = safe_int(body.get("disk"), 32)
+    bus = str(body.get("bus") or "scsi0")
+    ostype = str(body.get("ostype") or "l26")
+
+    payload = {
+        "vmid": vmid,
+        "name": name,
+        "cores": safe_int(body.get("cores"), 2),
+        "sockets": safe_int(body.get("sockets"), 1),
+        "memory": safe_int(body.get("memory"), 2048),
+        "ostype": ostype,
+        "scsihw": str(body.get("scsihw") or "virtio-scsi-single"),
+        "net0": "virtio,bridge=%s%s"
+        % (
+            str(body.get("bridge") or "vmbr0"),
+            (",tag=%d" % safe_int(body["vlan"])) if body.get("vlan") else "",
+        ),
+        bus: "%s:%d,discard=on,iothread=1" % (storage, disk_gb),
+        "agent": "1" if body.get("agent", True) else "0",
+        "onboot": 1 if body.get("onboot", True) else 0,
+        "boot": "order=%s;ide2" % bus,
+        "cpu": str(body.get("cpu") or "host"),
+    }
+    if body.get("iso"):
+        payload["ide2"] = "%s,media=cdrom" % str(body["iso"])
+    if body.get("bios") == "ovmf":
+        payload["bios"] = "ovmf"
+        payload["efidisk0"] = "%s:1,efitype=4m,pre-enrolled-keys=1" % storage
+        if ostype.startswith("win"):
+            payload["machine"] = "q35"
+            payload["tpmstate0"] = "%s:1,version=v2.0" % storage
+    if body.get("ciuser"):
+        payload["ciuser"] = str(body["ciuser"])
+        payload["cipassword"] = str(body.get("cipassword") or random_password())
+        payload["ipconfig0"] = str(body.get("ipconfig0") or "ip=dhcp")
+        payload["ide0"] = "%s:cloudinit" % storage
+    if body.get("sshkeys"):
+        payload["sshkeys"] = quote(str(body["sshkeys"]), safe="")
+    if body.get("description"):
+        payload["description"] = str(body["description"])[:500]
+    if body.get("tags"):
+        payload["tags"] = slugify(body["tags"], "hypervm")
+    payload = dict((k, v) for k, v in payload.items() if v not in ("", None))
+
+    task = PVE.create_qemu(node, payload)
+    CACHE.drop("fleet")
+    write_audit("create_qemu", "%s/qemu/%s" % (node, vmid), name)
+
+    if body.get("start", True):
+        for _ in range(10):
+            time.sleep(1.5)
+            try:
+                PVE.guest_action(node, "qemu", vmid, "start")
+                break
+            except ProxmoxError:
+                continue
+
+    if body.get("owner_id"):
+        try:
+            db_run(
+                "INSERT OR IGNORE INTO assignments(user_id,node,kind,vmid,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (safe_int(body["owner_id"]), node, "qemu", vmid, now_iso()),
+            )
+        except Exception as exc:
+            LOG.debug("assign after create failed: %s", exc)
+
+    return jsonify(ok=True, vmid=vmid, name=name, task=task)
+
+
+# ==============================================================================
+# SECTION 11 - REST API : AUDIT, EXPORT, HEALTH
+# ==============================================================================
+
+
+@APP.get("/api/audit")
+@admin_required
+def api_audit():
+    limit = min(safe_int(request.args.get("limit"), 200), 1000)
+    return jsonify(entries=db_all("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,)))
+
+
+@APP.get("/api/audit/export.csv")
+@owner_required
+def api_audit_export():
+    rows = db_all("SELECT * FROM audit ORDER BY id DESC LIMIT 5000")
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        ["id", "created_at", "username", "role", "action", "target", "detail", "ip", "ok"]
+    )
+    for row in rows:
+        writer.writerow(
+            [row["id"], row["created_at"], row["username"], row["role"], row["action"],
+             row["target"], row["detail"], row["ip"], row["ok"]]
+        )
+    return Response(
+        buffer.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=hypervm-audit.csv"},
+    )
+
+
+@APP.get("/api/inventory.csv")
+@admin_required
+def api_inventory_export():
+    snapshot = fleet_snapshot()
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        ["vmid", "name", "kind", "node", "status", "cpus", "cpu_pct",
+         "mem_used", "mem_total", "disk_total", "uptime"]
+    )
+    for g in snapshot["guests"]:
+        writer.writerow(
+            [g["vmid"], g["name"], g["kind_label"], g["node"], g["status"], g["cpus"],
+             g["cpu_pct"], g["mem_used"], g["mem_total"], g["disk_total"], g["uptime_h"]]
+        )
+    return Response(
+        buffer.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=hypervm-inventory.csv"},
+    )
+
+
+@APP.get("/api/health")
+def api_health():
+    state = {
+        "app": APP_NAME,
+        "vendor": APP_VENDOR,
+        "version": APP_VERSION,
+        "time": now_iso(),
+        "proxmox_configured": PVE.configured(),
+        "console_ready": PVE.console_capable() and bool(SOCK and ws_client),
+        "pandas": bool(pd),
+    }
+    if PVE.configured():
+        try:
+            state["proxmox_version"] = PVE.version()
+            state["reachable"] = True
+        except ProxmoxError as exc:
+            state["reachable"] = False
+            state["error"] = str(exc)
+    return jsonify(state)
+
+
+# ==============================================================================
+# SECTION 12 - WEB CONSOLE : ticket issuing + websocket bridge
+# ==============================================================================
+
+CONSOLE_SESSIONS = {}
+CONSOLE_LOCK = threading.RLock()
+
+
+def console_put(payload):
+    token = secrets.token_urlsafe(24)
+    with CONSOLE_LOCK:
+        CONSOLE_SESSIONS[token] = {"payload": payload, "created": time.time()}
+        for key in list(CONSOLE_SESSIONS):
+            if time.time() - CONSOLE_SESSIONS[key]["created"] > 300:
+                CONSOLE_SESSIONS.pop(key, None)
+    return token
+
+
+def console_take(token):
+    with CONSOLE_LOCK:
+        item = CONSOLE_SESSIONS.get(token)
+    if not item:
+        return None
+    if time.time() - item["created"] > 300:
+        with CONSOLE_LOCK:
+            CONSOLE_SESSIONS.pop(token, None)
+        return None
+    return item["payload"]
+
+
+@APP.post("/api/console/<kind>/<node>/<int:vmid>")
+@login_required
+def api_console_open(kind, node, vmid):
+    _guard(kind, node, vmid)
+    if not (SOCK and ws_client):
+        return jsonify(
+            error="Console bridge unavailable. Install flask-sock and websocket-client."
+        ), 503
+    data = PVE.term_proxy(node, kind, vmid) or {}
+    token = console_put(
+        {
+            "node": node,
+            "kind": "lxc" if kind in ("lxc", "ct") else "qemu",
+            "vmid": vmid,
+            "ticket": data.get("ticket"),
+            "port": data.get("port"),
+            "user": data.get("user") or PROXMOX_USER,
+        }
+    )
+    write_audit("console_open", "%s/%s/%s" % (node, kind, vmid))
+    return jsonify(ok=True, token=token, port=data.get("port"))
+
+
+@APP.post("/api/console/node/<node>")
+@owner_required
+def api_console_node(node):
+    if not (SOCK and ws_client):
+        return jsonify(error="Console bridge unavailable"), 503
+    data = PVE.node_term_proxy(node) or {}
+    token = console_put(
+        {
+            "node": node,
+            "kind": "node",
+            "vmid": 0,
+            "ticket": data.get("ticket"),
+            "port": data.get("port"),
+            "user": data.get("user") or PROXMOX_USER,
+        }
+    )
+    write_audit("console_open_node", node)
+    return jsonify(ok=True, token=token, port=data.get("port"))
+
+
+@APP.post("/api/console/vnc/<kind>/<node>/<int:vmid>")
+@login_required
+def api_console_vnc(kind, node, vmid):
+    """Returns a noVNC URL served by Proxmox itself (graphical console)."""
+    _guard(kind, node, vmid)
+    data = PVE.vnc_proxy(node, kind, vmid) or {}
+    host = urlparse(PROXMOX_URL)
+    url = "%s://%s/?console=%s&novnc=1&node=%s&resize=scale&vmid=%s" % (
+        host.scheme or "https",
+        host.netloc,
+        "kvm" if kind == "qemu" else "lxc",
+        quote(node, safe=""),
+        vmid,
+    )
+    return jsonify(
+        ok=True, url=url, port=data.get("port"), ticket_issued=bool(data.get("ticket"))
+    )
+
+
+def _proxmox_ws_url(node, kind, vmid, port, ticket):
+    host = urlparse(PROXMOX_URL)
+    scheme = "wss" if (host.scheme or "https") == "https" else "ws"
+    if kind == "node":
+        path = "/api2/json/nodes/%s/vncwebsocket" % quote(node, safe="")
+    else:
+        path = "/api2/json/nodes/%s/%s/%s/vncwebsocket" % (
+            quote(node, safe=""),
+            kind,
+            safe_int(vmid),
+        )
+    return "%s://%s%s?port=%s&vncticket=%s" % (
+        scheme,
+        host.netloc,
+        path,
+        quote(str(port), safe=""),
+        quote(str(ticket), safe=""),
+    )
+
+
+if SOCK and ws_client:
+
+    @SOCK.route("/ws/console/<token>")
+    def ws_console(sock, token):
+        """Bridge browser xterm.js <-> Proxmox termproxy websocket."""
+        payload = console_take(token)
+        if not payload:
+            sock.send("\r\n\x1b[31mConsole token expired. Reopen the console.\x1b[0m\r\n")
+            return
+
+        url = _proxmox_ws_url(
+            payload["node"],
+            payload["kind"],
+            payload["vmid"],
+            payload["port"],
+            payload["ticket"],
+        )
+        try:
+            tk = PVE.ticket()
+        except ProxmoxError as exc:
+            sock.send("\r\n\x1b[31m%s\x1b[0m\r\n" % exc)
+            return
+
+        headers = ["Cookie: PVEAuthCookie=%s" % (tk["ticket"] or "")]
+        sslopt = None if PROXMOX_VERIFY_TLS else {"cert_reqs": ssl.CERT_NONE}
+
+        try:
+            upstream = ws_client.create_connection(
+                url,
+                header=headers,
+                sslopt=sslopt,
+                subprotocols=["binary"],
+                timeout=15,
+            )
+        except Exception as exc:
+            sock.send("\r\n\x1b[31mConsole connection failed: %s\x1b[0m\r\n" % exc)
+            return
+
+        # Proxmox expects "user:ticket\n" as the very first frame.
+        try:
+            upstream.send("%s:%s\n" % (payload["user"], payload["ticket"]))
+        except Exception as exc:
+            sock.send("\r\n\x1b[31mConsole handshake failed: %s\x1b[0m\r\n" % exc)
+            upstream.close()
+            return
+
+        stop = threading.Event()
+
+        def pump_up():
+            """Proxmox -> browser."""
+            try:
+                while not stop.is_set():
+                    frame = upstream.recv()
+                    if frame is None:
+                        break
+                    if isinstance(frame, bytes):
+                        frame = frame.decode("utf-8", "replace")
+                    if frame:
+                        sock.send(frame)
+            except Exception:
+                pass
+            finally:
+                stop.set()
+
+        def keepalive():
+            while not stop.wait(25):
+                try:
+                    upstream.send("2")
+                except Exception:
+                    break
+
+        threading.Thread(target=pump_up, daemon=True).start()
+        threading.Thread(target=keepalive, daemon=True).start()
+
+        try:
+            while not stop.is_set():
+                message = sock.receive(timeout=30)
+                if message is None:
+                    continue
+                if isinstance(message, bytes):
+                    message = message.decode("utf-8", "replace")
+                if message.startswith("\x01RESIZE:"):
+                    try:
+                        _, cols, rows = message.split(":")
+                        upstream.send("1:%s:%s:" % (safe_int(cols, 80), safe_int(rows, 24)))
+                    except Exception:
+                        pass
+                    continue
+                upstream.send("0:%d:%s" % (len(message), message))
+        except Exception:
+            pass
+        finally:
+            stop.set()
+            try:
+                upstream.close()
+            except Exception:
+                pass
